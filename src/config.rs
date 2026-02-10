@@ -24,6 +24,8 @@ pub struct ZellijState {
     pub start_time: DateTime<Local>,
     pub incoming_notification: Option<notification::Message>,
     pub cache_mask: u8,
+    /// Per-tab name overrides set via "title" pipe messages
+    pub tab_name_overrides: BTreeMap<usize, String>,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]

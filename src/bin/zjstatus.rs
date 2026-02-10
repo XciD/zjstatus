@@ -100,24 +100,41 @@ impl ZellijPlugin for State {
             start_time: Local::now(),
             cache_mask: 0,
             incoming_notification: None,
+            tab_name_overrides: BTreeMap::new(),
         };
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        // Handle "title" pipe for tab naming
+        if pipe_message.name == "title" {
+            if let Some(payload) = pipe_message.payload {
+                let tab_pos = if let Some(pane_id_str) = pipe_message.args.get("pane_id") {
+                    if let Ok(pane_id) = pane_id_str.parse::<u32>() {
+                        self.find_tab_for_pane(pane_id)
+                    } else {
+                        self.state.tabs.iter().position(|t| t.active)
+                    }
+                } else {
+                    self.state.tabs.iter().position(|t| t.active)
+                };
+
+                if let Some(pos) = tab_pos {
+                    if payload.is_empty() {
+                        self.state.tab_name_overrides.remove(&pos);
+                    } else {
+                        self.state.tab_name_overrides.insert(pos, payload);
+                    }
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         let mut should_render = false;
 
         match pipe_message.source {
-            PipeSource::Cli(_) => {
-                if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
-                }
-            }
-            PipeSource::Plugin(_) => {
-                if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
-                }
-            }
-            PipeSource::Keybind => {
+            PipeSource::Cli(_) | PipeSource::Plugin(_) | PipeSource::Keybind => {
                 if let Some(input) = pipe_message.payload {
                     should_render = pipe::parse_protocol(&mut self.state, &input);
                 }
@@ -175,6 +192,17 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
+        for tab in &self.state.tabs {
+            if let Some(panes) = self.state.panes.panes.get(&tab.position) {
+                if panes.iter().any(|p| p.id == pane_id && !p.is_plugin) {
+                    return Some(tab.position);
+                }
+            }
+        }
+        None
+    }
+
     fn handle_event(&mut self, event: Event) -> bool {
         let mut should_render = false;
         match event {

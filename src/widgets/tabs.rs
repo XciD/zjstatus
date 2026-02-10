@@ -5,6 +5,8 @@ use zellij_tile::{
     shim::switch_tab_to,
 };
 
+use anstyle::Style;
+
 use crate::{config::ZellijState, render::FormattedPart};
 
 use super::widget::Widget;
@@ -24,6 +26,7 @@ pub struct TabsWidget {
     tab_display_count: Option<usize>,
     tab_truncate_start_format: Vec<FormattedPart>,
     tab_truncate_end_format: Vec<FormattedPart>,
+    tab_name_max_len: usize,
 }
 
 impl TabsWidget {
@@ -82,6 +85,11 @@ impl TabsWidget {
             .get("tab_separator")
             .map(|s| FormattedPart::from_format_string(s, config));
 
+        let tab_name_max_len = config
+            .get("tab_name_max_len")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
         Self {
             normal_tab_format,
             normal_tab_fullscreen_format,
@@ -97,6 +105,7 @@ impl TabsWidget {
             tab_display_count,
             tab_truncate_start_format,
             tab_truncate_end_format,
+            tab_name_max_len,
         }
     }
 }
@@ -122,7 +131,8 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let content = self.render_tab(tab, &state.panes, &state.mode);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides);
+            let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
             counter += 1;
 
             output = format!("{}{}", output, content);
@@ -183,7 +193,8 @@ impl Widget for TabsWidget {
         for tab in &tabs {
             counter += 1;
 
-            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides);
+            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
 
             if counter < tabs.len()
                 && let Some(sep) = &self.separator
@@ -250,7 +261,13 @@ impl TabsWidget {
         &self.normal_tab_format
     }
 
-    fn render_tab(&self, tab: &TabInfo, panes: &PaneManifest, mode: &ModeInfo) -> String {
+    fn render_tab(
+        &self,
+        tab: &TabInfo,
+        panes: &PaneManifest,
+        mode: &ModeInfo,
+        display_name: &str,
+    ) -> String {
         let formatters = self.select_format(tab, mode);
         let mut output = "".to_owned();
 
@@ -262,7 +279,7 @@ impl TabsWidget {
                     true => "Enter name...",
                     false => tab.name.as_str(),
                 },
-                _name => tab.name.as_str(),
+                _name => display_name,
             };
 
             if content.contains("{name}") {
@@ -285,10 +302,83 @@ impl TabsWidget {
 
             content = self.replace_indicators(content, tab, panes);
 
-            output = format!("{}{}", output, f.format_string(&content));
+            // If content contains inline format codes (e.g. from tab name),
+            // re-parse and render each sub-part, inheriting parent style
+            if content.contains("#[") {
+                let empty_config = BTreeMap::new();
+                let sub_parts =
+                    FormattedPart::multiple_from_format_string(&content, &empty_config);
+                for sub in &sub_parts {
+                    let style = Style::new()
+                        .fg_color(sub.fg.or(f.fg))
+                        .bg_color(sub.bg.or(f.bg))
+                        .underline_color(sub.us.or(f.us))
+                        .effects(if sub.effects == anstyle::Effects::new() {
+                            f.effects
+                        } else {
+                            sub.effects
+                        });
+                    output = format!(
+                        "{}{}{}{}",
+                        output,
+                        style.render_reset(),
+                        style.render(),
+                        sub.content
+                    );
+                }
+                output = format!("{}{}", output, Style::new().render_reset());
+            } else {
+                output = format!("{}{}", output, f.format_string(&content));
+            }
         }
 
         output.to_owned()
+    }
+
+    fn resolve_tab_name(
+        &self,
+        tab: &TabInfo,
+        panes: &PaneManifest,
+        overrides: &BTreeMap<usize, String>,
+    ) -> String {
+        // Use pipe override if available
+        if let Some(name) = overrides.get(&tab.position) {
+            return name.clone();
+        }
+
+        // Auto-name from first real pane's title
+        if let Some(tab_panes) = panes.panes.get(&tab.position) {
+            let real_panes: Vec<&PaneInfo> = tab_panes.iter().filter(|p| !p.is_plugin).collect();
+            if let Some(first) = real_panes.first() {
+                if !first.title.is_empty() {
+                    let name = self.truncate_name(&first.title);
+                    return if real_panes.len() > 1 {
+                        format!("{} (+{})", name, real_panes.len() - 1)
+                    } else {
+                        name
+                    };
+                }
+            }
+        }
+
+        // Fallback to zellij tab name
+        tab.name.clone()
+    }
+
+    fn truncate_name(&self, name: &str) -> String {
+        // Use basename if it looks like a path
+        let name = if name.contains('/') {
+            name.rsplit('/').next().unwrap_or(name)
+        } else {
+            name
+        };
+
+        if self.tab_name_max_len > 0 && name.chars().count() > self.tab_name_max_len {
+            let truncated: String = name.chars().take(self.tab_name_max_len - 1).collect();
+            format!("{}…", truncated)
+        } else {
+            name.to_string()
+        }
     }
 
     fn replace_indicators(&self, content: String, tab: &TabInfo, panes: &PaneManifest) -> String {
