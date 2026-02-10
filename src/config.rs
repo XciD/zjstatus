@@ -26,6 +26,8 @@ pub struct ZellijState {
     pub cache_mask: u8,
     /// Per-tab name overrides set via "title" pipe messages
     pub tab_name_overrides: BTreeMap<usize, String>,
+    /// Current spinner frame index for animated tab names
+    pub spinner_idx: usize,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]

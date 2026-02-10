@@ -11,6 +11,8 @@ use crate::{config::ZellijState, render::FormattedPart};
 
 use super::widget::Widget;
 
+const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
+
 pub struct TabsWidget {
     active_tab_format: Vec<FormattedPart>,
     active_tab_fullscreen_format: Vec<FormattedPart>,
@@ -131,7 +133,7 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, state.spinner_idx);
             let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
             counter += 1;
 
@@ -193,7 +195,7 @@ impl Widget for TabsWidget {
         for tab in &tabs {
             counter += 1;
 
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, state.spinner_idx);
             let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
 
             if counter < tabs.len()
@@ -340,15 +342,22 @@ impl TabsWidget {
         tab: &TabInfo,
         panes: &PaneManifest,
         overrides: &BTreeMap<usize, String>,
+        spinner_idx: usize,
     ) -> String {
         // Use pipe override if available
         if let Some(name) = overrides.get(&tab.position) {
+            let name = if name.contains("{spin}") {
+                let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
+                name.replace("{spin}", &frame.to_string())
+            } else {
+                name.clone()
+            };
             // Formatted overrides (from Claude hooks) pass through as-is
             // Plain text overrides (from fish PWD) get truncated
             return if name.contains("#[") {
-                name.clone()
+                name
             } else {
-                self.truncate_name(name)
+                self.truncate_name(&name)
             };
         }
 

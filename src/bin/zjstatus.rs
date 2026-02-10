@@ -73,6 +73,7 @@ impl ZellijPlugin for State {
             EventType::TabUpdate,
             EventType::SessionUpdate,
             EventType::RunCommandResult,
+            EventType::Timer,
         ]);
 
         self.module_config = match ModuleConfig::new(&configuration) {
@@ -101,6 +102,7 @@ impl ZellijPlugin for State {
             cache_mask: 0,
             incoming_notification: None,
             tab_name_overrides: BTreeMap::new(),
+            spinner_idx: 0,
         };
     }
 
@@ -122,7 +124,11 @@ impl ZellijPlugin for State {
                     if payload.is_empty() {
                         self.state.tab_name_overrides.remove(&pos);
                     } else {
+                        let has_spin = payload.contains("{spin}");
                         self.state.tab_name_overrides.insert(pos, payload);
+                        if has_spin {
+                            set_timeout(0.3);
+                        }
                     }
                     self.state.cache_mask = UpdateEventMask::Tab as u8;
                     return true;
@@ -321,6 +327,23 @@ impl State {
                 self.state.tabs = tab_info;
 
                 should_render = true;
+            }
+            Event::Timer(_) => {
+                tracing::Span::current().record("event_type", "Event::Timer");
+
+                self.state.spinner_idx = self.state.spinner_idx.wrapping_add(1);
+                self.state.cache_mask = UpdateEventMask::Tab as u8;
+
+                // Keep the timer running while any override contains {spin}
+                let has_spin = self
+                    .state
+                    .tab_name_overrides
+                    .values()
+                    .any(|v| v.contains("{spin}"));
+                if has_spin {
+                    set_timeout(0.3);
+                    should_render = true;
+                }
             }
             _ => (),
         };
