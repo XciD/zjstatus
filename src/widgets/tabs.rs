@@ -11,7 +11,7 @@ use crate::{config::ZellijState, render::FormattedPart};
 
 use super::widget::Widget;
 
-const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
+const SPINNER_FRAMES: &[&str] = &["✦", "✶", "✽", "✶"];
 
 pub struct TabsWidget {
     active_tab_format: Vec<FormattedPart>,
@@ -133,7 +133,7 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, state.spinner_idx);
+            let display_name = self.resolve_tab_name(tab, &state.tab_name_overrides, state.spinner_idx);
             let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
             counter += 1;
 
@@ -195,7 +195,7 @@ impl Widget for TabsWidget {
         for tab in &tabs {
             counter += 1;
 
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, state.spinner_idx);
+            let display_name = self.resolve_tab_name(tab, &state.tab_name_overrides, state.spinner_idx);
             let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
 
             if counter < tabs.len()
@@ -340,7 +340,6 @@ impl TabsWidget {
     fn resolve_tab_name(
         &self,
         tab: &TabInfo,
-        panes: &PaneManifest,
         overrides: &BTreeMap<usize, String>,
         spinner_idx: usize,
     ) -> String {
@@ -348,7 +347,7 @@ impl TabsWidget {
         if let Some(name) = overrides.get(&tab.position) {
             let name = if name.contains("{spin}") {
                 let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
-                name.replace("{spin}", &frame.to_string())
+                name.replace("{spin}", frame)
             } else {
                 name.clone()
             };
@@ -359,21 +358,6 @@ impl TabsWidget {
             } else {
                 self.truncate_name(&name)
             };
-        }
-
-        // Auto-name from first real pane's title
-        if let Some(tab_panes) = panes.panes.get(&tab.position) {
-            let real_panes: Vec<&PaneInfo> = tab_panes.iter().filter(|p| !p.is_plugin).collect();
-            if let Some(first) = real_panes.first() {
-                if !first.title.is_empty() {
-                    let name = self.truncate_name(&first.title);
-                    return if real_panes.len() > 1 {
-                        format!("{} (+{})", name, real_panes.len() - 1)
-                    } else {
-                        name
-                    };
-                }
-            }
         }
 
         // Fallback to zellij tab name

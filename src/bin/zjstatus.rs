@@ -29,6 +29,9 @@ struct State {
     module_config: config::ModuleConfig,
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     err: Option<anyhow::Error>,
+    timer_active: bool,
+    pending_pipe_overrides: Vec<(u32, String)>,
+    synced_from_host: bool,
 }
 
 #[cfg(not(test))]
@@ -110,25 +113,27 @@ impl ZellijPlugin for State {
         // Handle "title" pipe for tab naming
         if pipe_message.name == "title" {
             if let Some(payload) = pipe_message.payload {
-                let tab_pos = if let Some(pane_id_str) = pipe_message.args.get("pane_id") {
-                    if let Ok(pane_id) = pane_id_str.parse::<u32>() {
-                        self.find_tab_for_pane(pane_id)
-                    } else {
-                        self.state.tabs.iter().position(|t| t.active)
+                let pane_id = pipe_message
+                    .args
+                    .get("pane_id")
+                    .and_then(|s| s.parse::<u32>().ok());
+
+                let tab_pos = pane_id.and_then(|id| self.find_tab_for_pane(id));
+
+                if tab_pos.is_none() {
+                    if let Some(id) = pane_id {
+                        // PaneManifest not ready yet, store for later resolution
+                        self.pending_pipe_overrides.push((id, payload));
+                        return false;
                     }
-                } else {
-                    self.state.tabs.iter().position(|t| t.active)
-                };
+                }
 
                 if let Some(pos) = tab_pos {
                     if payload.is_empty() {
                         self.state.tab_name_overrides.remove(&pos);
                     } else {
-                        let has_spin = payload.contains("{spin}");
                         self.state.tab_name_overrides.insert(pos, payload);
-                        if has_spin {
-                            set_timeout(0.3);
-                        }
+                        self.ensure_timer();
                     }
                     self.state.cache_mask = UpdateEventMask::Tab as u8;
                     return true;
@@ -187,6 +192,8 @@ impl ZellijPlugin for State {
 
         self.state.cols = cols;
 
+        self.ensure_timer();
+
         tracing::debug!("{:?}", self.state.mode.session_name);
 
         let output = self
@@ -198,6 +205,51 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn ensure_timer(&mut self) {
+        if !self.timer_active
+            && self
+                .state
+                .tab_name_overrides
+                .values()
+                .any(|v| v.contains("{spin}"))
+        {
+            self.timer_active = true;
+            set_timeout(0.3);
+        }
+    }
+
+    fn resolve_pending_overrides(&mut self) {
+        let pending = std::mem::take(&mut self.pending_pipe_overrides);
+        for (pane_id, payload) in pending {
+            if let Some(pos) = self.find_tab_for_pane(pane_id) {
+                if payload.is_empty() {
+                    self.state.tab_name_overrides.remove(&pos);
+                } else {
+                    self.state.tab_name_overrides.insert(pos, payload);
+                }
+            } else {
+                self.pending_pipe_overrides.push((pane_id, payload));
+            }
+        }
+    }
+
+    fn maybe_sync_from_host(&mut self) {
+        if !self.synced_from_host
+            && !self.state.tabs.is_empty()
+            && !self.state.panes.panes.is_empty()
+        {
+            self.synced_from_host = true;
+            run_command(
+                &[
+                    "sh",
+                    "-c",
+                    "for f in /tmp/zjstatus-pane-*; do [ -f \"$f\" ] && id=\"${f##*-}\" && printf '%s:%s\\n' \"$id\" \"$(cat \"$f\")\"; done",
+                ],
+                BTreeMap::from([("name".to_string(), "sync_overrides".to_string())]),
+            );
+        }
+    }
+
     fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
         for tab in &self.state.tabs {
             if let Some(panes) = self.state.panes.panes.get(&tab.position) {
@@ -253,6 +305,10 @@ impl State {
                 self.state.panes = pane_info;
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
 
+                self.resolve_pending_overrides();
+                self.maybe_sync_from_host();
+                self.ensure_timer();
+
                 should_render = true;
             }
             Event::PermissionRequestResult(result) => {
@@ -269,28 +325,51 @@ impl State {
                     context = ?context
                 );
 
-                self.state.cache_mask = UpdateEventMask::Command as u8;
-
                 if let Some(name) = context.get("name") {
-                    let stdout = match String::from_utf8(stdout) {
-                        Ok(s) => s,
-                        Err(_) => "".to_owned(),
-                    };
+                    if name == "sync_overrides" {
+                        let stdout = String::from_utf8(stdout).unwrap_or_default();
+                        for line in stdout.lines() {
+                            if let Some((id_str, payload)) = line.split_once(':') {
+                                if let Ok(pane_id) = id_str.parse::<u32>() {
+                                    if let Some(pos) = self.find_tab_for_pane(pane_id) {
+                                        if !self.state.tab_name_overrides.contains_key(&pos)
+                                            && !payload.is_empty()
+                                        {
+                                            self.state.tab_name_overrides.insert(
+                                                pos,
+                                                payload.to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.ensure_timer();
+                        self.state.cache_mask = UpdateEventMask::Tab as u8;
+                        should_render = true;
+                    } else {
+                        self.state.cache_mask = UpdateEventMask::Command as u8;
 
-                    let stderr = match String::from_utf8(stderr) {
-                        Ok(s) => s,
-                        Err(_) => "".to_owned(),
-                    };
+                        let stdout = match String::from_utf8(stdout) {
+                            Ok(s) => s,
+                            Err(_) => "".to_owned(),
+                        };
 
-                    self.state.command_results.insert(
-                        name.to_owned(),
-                        CommandResult {
-                            exit_code,
-                            stdout,
-                            stderr,
-                            context,
-                        },
-                    );
+                        let stderr = match String::from_utf8(stderr) {
+                            Ok(s) => s,
+                            Err(_) => "".to_owned(),
+                        };
+
+                        self.state.command_results.insert(
+                            name.to_owned(),
+                            CommandResult {
+                                exit_code,
+                                stdout,
+                                stderr,
+                                context,
+                            },
+                        );
+                    }
                 }
             }
             Event::SessionUpdate(session_info, _) => {
@@ -326,6 +405,10 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
+                self.resolve_pending_overrides();
+                self.maybe_sync_from_host();
+                self.ensure_timer();
+
                 should_render = true;
             }
             Event::Timer(_) => {
@@ -342,8 +425,10 @@ impl State {
                     .any(|v| v.contains("{spin}"));
                 if has_spin {
                     set_timeout(0.3);
-                    should_render = true;
+                } else {
+                    self.timer_active = false;
                 }
+                should_render = true;
             }
             _ => (),
         };
