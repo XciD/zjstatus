@@ -30,7 +30,7 @@ struct State {
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     err: Option<anyhow::Error>,
     timer_active: bool,
-    pending_pipe_overrides: Vec<(u32, String)>,
+    pending_pipe_overrides: Vec<(u32, String, Option<String>)>,
     synced_from_host: bool,
 }
 
@@ -105,6 +105,7 @@ impl ZellijPlugin for State {
             cache_mask: 0,
             incoming_notification: None,
             tab_name_overrides: BTreeMap::new(),
+            tab_name_fallbacks: BTreeMap::new(),
             spinner_idx: 0,
         };
     }
@@ -123,16 +124,32 @@ impl ZellijPlugin for State {
                 if tab_pos.is_none() {
                     if let Some(id) = pane_id {
                         // PaneManifest not ready yet, store for later resolution
-                        self.pending_pipe_overrides.push((id, payload));
+                        let fb = pipe_message.args.get("fallback").cloned();
+                        self.pending_pipe_overrides.push((id, payload, fb));
                         return false;
                     }
                 }
 
                 if let Some(pos) = tab_pos {
+                    let id = pane_id.unwrap();
                     if payload.is_empty() {
-                        self.state.tab_name_overrides.remove(&pos);
+                        if let Some(inner) = self.state.tab_name_overrides.get_mut(&pos) {
+                            inner.remove(&id);
+                            if inner.is_empty() {
+                                self.state.tab_name_overrides.remove(&pos);
+                            }
+                        }
+                        if let Some(inner) = self.state.tab_name_fallbacks.get_mut(&pos) {
+                            inner.remove(&id);
+                            if inner.is_empty() {
+                                self.state.tab_name_fallbacks.remove(&pos);
+                            }
+                        }
                     } else {
-                        self.state.tab_name_overrides.insert(pos, payload);
+                        self.state.tab_name_overrides.entry(pos).or_default().insert(id, payload);
+                        if let Some(fb) = pipe_message.args.get("fallback") {
+                            self.state.tab_name_fallbacks.entry(pos).or_default().insert(id, fb.clone());
+                        }
                         self.ensure_timer();
                     }
                     self.state.cache_mask = UpdateEventMask::Tab as u8;
@@ -211,6 +228,7 @@ impl State {
                 .state
                 .tab_name_overrides
                 .values()
+                .flat_map(|m| m.values())
                 .any(|v| v.contains("{spin}"))
         {
             self.timer_active = true;
@@ -220,15 +238,23 @@ impl State {
 
     fn resolve_pending_overrides(&mut self) {
         let pending = std::mem::take(&mut self.pending_pipe_overrides);
-        for (pane_id, payload) in pending {
+        for (pane_id, payload, fallback) in pending {
             if let Some(pos) = self.find_tab_for_pane(pane_id) {
                 if payload.is_empty() {
-                    self.state.tab_name_overrides.remove(&pos);
+                    if let Some(inner) = self.state.tab_name_overrides.get_mut(&pos) {
+                        inner.remove(&pane_id);
+                        if inner.is_empty() {
+                            self.state.tab_name_overrides.remove(&pos);
+                        }
+                    }
                 } else {
-                    self.state.tab_name_overrides.insert(pos, payload);
+                    self.state.tab_name_overrides.entry(pos).or_default().insert(pane_id, payload);
+                    if let Some(fb) = fallback {
+                        self.state.tab_name_fallbacks.entry(pos).or_default().insert(pane_id, fb);
+                    }
                 }
             } else {
-                self.pending_pipe_overrides.push((pane_id, payload));
+                self.pending_pipe_overrides.push((pane_id, payload, fallback));
             }
         }
     }
@@ -332,13 +358,11 @@ impl State {
                             if let Some((id_str, payload)) = line.split_once(':') {
                                 if let Ok(pane_id) = id_str.parse::<u32>() {
                                     if let Some(pos) = self.find_tab_for_pane(pane_id) {
-                                        if !self.state.tab_name_overrides.contains_key(&pos)
+                                        let inner = self.state.tab_name_overrides.entry(pos).or_default();
+                                        if !inner.contains_key(&pane_id)
                                             && !payload.is_empty()
                                         {
-                                            self.state.tab_name_overrides.insert(
-                                                pos,
-                                                payload.to_string(),
-                                            );
+                                            inner.insert(pane_id, payload.to_string());
                                         }
                                     }
                                 }
@@ -422,6 +446,7 @@ impl State {
                     .state
                     .tab_name_overrides
                     .values()
+                    .flat_map(|m| m.values())
                     .any(|v| v.contains("{spin}"));
                 if has_spin {
                     set_timeout(0.3);

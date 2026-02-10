@@ -24,8 +24,10 @@ pub struct ZellijState {
     pub start_time: DateTime<Local>,
     pub incoming_notification: Option<notification::Message>,
     pub cache_mask: u8,
-    /// Per-tab name overrides set via "title" pipe messages
-    pub tab_name_overrides: BTreeMap<usize, String>,
+    /// Per-tab name overrides: tab_pos → (pane_id → status)
+    pub tab_name_overrides: BTreeMap<usize, BTreeMap<u32, String>>,
+    /// Per-tab fallback names: tab_pos → (pane_id → project name)
+    pub tab_name_fallbacks: BTreeMap<usize, BTreeMap<u32, String>>,
     /// Current spinner frame index for animated tab names
     pub spinner_idx: usize,
 }

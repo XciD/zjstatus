@@ -13,6 +13,18 @@ use super::widget::Widget;
 
 const SPINNER_FRAMES: &[&str] = &["✦", "✶", "✽", "✶"];
 
+/// Strip leading spinner prefix (e.g. "⠋ " or "● ") from pane titles.
+/// Returns (stripped_text, had_prefix).
+fn strip_spinner_prefix(s: &str) -> (String, bool) {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if !c.is_alphanumeric() => {
+            (chars.as_str().trim_start().to_string(), true)
+        }
+        _ => (s.to_string(), false),
+    }
+}
+
 pub struct TabsWidget {
     active_tab_format: Vec<FormattedPart>,
     active_tab_fullscreen_format: Vec<FormattedPart>,
@@ -120,6 +132,16 @@ impl Widget for TabsWidget {
         let (truncated_start, truncated_end, tabs) =
             get_tab_window(&state.tabs, self.tab_display_count);
 
+        // ~6 chars overhead per tab (index, spaces, formatting)
+        let per_tab_overhead = 6;
+        let name_max_len = if !tabs.is_empty() && state.cols > 0 {
+            let available = state.cols.saturating_sub(tabs.len() * per_tab_overhead);
+            let dynamic = available / tabs.len();
+            cmp::max(5, dynamic)
+        } else {
+            self.tab_name_max_len
+        };
+
         if truncated_start > 0 {
             for f in &self.tab_truncate_start_format {
                 let mut content = f.content.clone();
@@ -133,7 +155,7 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let display_name = self.resolve_tab_name(tab, &state.tab_name_overrides, state.spinner_idx);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx, name_max_len);
             let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
             counter += 1;
 
@@ -192,10 +214,19 @@ impl Widget for TabsWidget {
             }
         }
 
+        let per_tab_overhead = 6;
+        let name_max_len = if !tabs.is_empty() && state.cols > 0 {
+            let available = state.cols.saturating_sub(tabs.len() * per_tab_overhead);
+            let dynamic = available / tabs.len();
+            cmp::max(5, dynamic)
+        } else {
+            self.tab_name_max_len
+        };
+
         for tab in &tabs {
             counter += 1;
 
-            let display_name = self.resolve_tab_name(tab, &state.tab_name_overrides, state.spinner_idx);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx, name_max_len);
             let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
 
             if counter < tabs.len()
@@ -340,31 +371,94 @@ impl TabsWidget {
     fn resolve_tab_name(
         &self,
         tab: &TabInfo,
-        overrides: &BTreeMap<usize, String>,
+        panes: &PaneManifest,
+        overrides: &BTreeMap<usize, BTreeMap<u32, String>>,
+        fallbacks: &BTreeMap<usize, BTreeMap<u32, String>>,
         spinner_idx: usize,
+        name_max_len: usize,
     ) -> String {
-        // Use pipe override if available
-        if let Some(name) = overrides.get(&tab.position) {
-            let name = if name.contains("{spin}") {
+        let tab_panes = panes.panes.get(&tab.position);
+
+        // Check for pipe overrides (multiple Claude instances possible)
+        if let Some(tab_ovr) = overrides.get(&tab.position) {
+            if !tab_ovr.is_empty() {
                 let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
-                name.replace("{spin}", frame)
-            } else {
-                name.clone()
-            };
-            // Formatted overrides (from Claude hooks) pass through as-is
-            // Plain text overrides (from fish PWD) get truncated
-            return if name.contains("#[") {
-                name
-            } else {
-                self.truncate_name(&name)
-            };
+                let tab_fb = fallbacks.get(&tab.position);
+
+                // Keep pane order (BTreeMap iterates by ascending pane_id = visual order)
+                // Chain status symbols: strip "🤖 " prefix from each, combine under one 🤖
+                let symbols: Vec<String> = tab_ovr
+                    .values()
+                    .map(|raw| {
+                        let sym = raw.strip_prefix("🤖 ").unwrap_or(raw).to_string();
+                        if sym.contains("{spin}") { sym.replace("{spin}", frame) } else { sym }
+                    })
+                    .collect();
+                let chained = format!("🤖 {}", symbols.join(" "));
+
+                // Text from the spinning Claude (or first if none spinning)
+                let best_id = tab_ovr
+                    .iter()
+                    .find(|(_, s)| s.contains("{spin}"))
+                    .or_else(|| tab_ovr.iter().next())
+                    .map(|(id, _)| id)
+                    .unwrap();
+                let project = tab_fb
+                    .and_then(|m| m.get(best_id))
+                    .map(|s| s.as_str());
+                let pane_title = tab_panes
+                    .and_then(|ps| ps.iter().find(|p| p.id == *best_id && !p.is_plugin))
+                    .and_then(|p| {
+                        let (title, _) = strip_spinner_prefix(&p.title);
+                        if title.is_empty() { None } else { Some(title) }
+                    });
+
+                let text = match (project, pane_title.as_deref()) {
+                    (Some(p), Some(t)) => Some(format!("{} {}", p, t)),
+                    (Some(p), None) => Some(p.to_string()),
+                    (None, Some(t)) => Some(t.to_string()),
+                    (None, None) => None,
+                };
+
+                let extra = tab_ovr.len() - 1;
+                let suffix = if extra > 0 { format!(" (+{})", extra) } else { String::new() };
+                let sep = if extra > 0 { " | " } else { " " };
+
+                return if let Some(t) = text {
+                    format!("{}{}{}{}", chained, sep, self.truncate_name_dynamic(&t, name_max_len), suffix)
+                } else {
+                    format!("{}{}", chained, suffix)
+                };
+            }
+        }
+
+        // No override: use focused pane title (🤖 prefix if Claude detected)
+        let non_plugin: Vec<_> = tab_panes
+            .map(|ps| ps.iter().filter(|p| !p.is_plugin).collect())
+            .unwrap_or_default();
+
+        let focused = non_plugin
+            .iter()
+            .find(|p| p.is_focused)
+            .or(non_plugin.first());
+
+        if let Some(pane) = focused {
+            let (title, is_claude) = strip_spinner_prefix(&pane.title);
+            if !title.is_empty() {
+                let truncated = self.truncate_name_dynamic(&title, name_max_len);
+                return if is_claude {
+                    format!("🤖 {}", truncated)
+                } else {
+                    truncated
+                };
+            }
         }
 
         // Fallback to zellij tab name
         tab.name.clone()
     }
 
-    fn truncate_name(&self, name: &str) -> String {
+    fn truncate_name_dynamic(&self, name: &str, max_len: usize) -> String {
         // Use basename if it looks like a path
         let name = if name.contains('/') {
             name.rsplit('/').next().unwrap_or(name)
@@ -372,8 +466,8 @@ impl TabsWidget {
             name
         };
 
-        if self.tab_name_max_len > 0 && name.chars().count() > self.tab_name_max_len {
-            let truncated: String = name.chars().take(self.tab_name_max_len - 1).collect();
+        if max_len > 0 && name.chars().count() > max_len {
+            let truncated: String = name.chars().take(max_len.saturating_sub(1)).collect();
             format!("{}…", truncated)
         } else {
             name.to_string()
