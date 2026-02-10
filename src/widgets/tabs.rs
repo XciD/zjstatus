@@ -343,7 +343,13 @@ impl TabsWidget {
     ) -> String {
         // Use pipe override if available
         if let Some(name) = overrides.get(&tab.position) {
-            return name.clone();
+            // Formatted overrides (from Claude hooks) pass through as-is
+            // Plain text overrides (from fish PWD) get truncated
+            return if name.contains("#[") {
+                name.clone()
+            } else {
+                self.truncate_name(name)
+            };
         }
 
         // Auto-name from first real pane's title
