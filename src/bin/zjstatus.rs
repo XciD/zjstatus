@@ -139,31 +139,53 @@ impl ZellijPlugin for State {
                     }
                 }
 
+                // Empty payload = clear override (search all tabs since pane may be gone)
+                if payload.is_empty() {
+                    if let Some(id) = pane_id {
+                        for inner in self.state.tab_name_overrides.values_mut() {
+                            inner.remove(&id);
+                        }
+                        self.state.tab_name_overrides.retain(|_, m| !m.is_empty());
+                        for inner in self.state.tab_name_fallbacks.values_mut() {
+                            inner.remove(&id);
+                        }
+                        self.state.tab_name_fallbacks.retain(|_, m| !m.is_empty());
+                        self.state.cache_mask = UpdateEventMask::Tab as u8;
+                        return true;
+                    }
+                    return false;
+                }
+
                 if let Some(pos) = tab_pos {
                     let id = pane_id.unwrap();
-                    if payload.is_empty() {
-                        if let Some(inner) = self.state.tab_name_overrides.get_mut(&pos) {
-                            inner.remove(&id);
-                            if inner.is_empty() {
-                                self.state.tab_name_overrides.remove(&pos);
-                            }
-                        }
-                        if let Some(inner) = self.state.tab_name_fallbacks.get_mut(&pos) {
-                            inner.remove(&id);
-                            if inner.is_empty() {
-                                self.state.tab_name_fallbacks.remove(&pos);
-                            }
-                        }
-                    } else {
-                        self.state.tab_name_overrides.entry(pos).or_default().insert(id, payload);
-                        if let Some(fb) = pipe_message.args.get("fallback") {
-                            self.state.tab_name_fallbacks.entry(pos).or_default().insert(id, fb.clone());
-                        }
-                        self.ensure_timer();
+                    self.state.tab_name_overrides.entry(pos).or_default().insert(id, payload);
+                    if let Some(fb) = pipe_message.args.get("fallback") {
+                        self.state.tab_name_fallbacks.entry(pos).or_default().insert(id, fb.clone());
                     }
+                    self.ensure_timer();
                     self.state.cache_mask = UpdateEventMask::Tab as u8;
                     return true;
                 }
+            }
+            return false;
+        }
+
+        // Handle "focus" pipe to switch to tab containing a pane
+        if pipe_message.name == "focus" {
+            // Verify session matches
+            if let Some(target_session) = pipe_message.args.get("session") {
+                if let Some(ref current_session) = self.state.mode.session_name {
+                    if target_session != current_session {
+                        return false;
+                    }
+                }
+            }
+            if let Some(pane_id) = pipe_message
+                .args
+                .get("pane_id")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                focus_terminal_pane(pane_id, false);
             }
             return false;
         }
@@ -366,7 +388,6 @@ impl State {
                     if name == "sync_overrides" {
                         // Format: pane_id<TAB>fallback<TAB>payload
                         let stdout = String::from_utf8(stdout).unwrap_or_default();
-                        let mut valid_lines = Vec::new();
                         for line in stdout.lines() {
                             let parts: Vec<&str> = line.splitn(3, '\t').collect();
                             if parts.len() >= 3 {
@@ -374,7 +395,6 @@ impl State {
                                     let fallback = parts[1];
                                     let payload = parts[2];
                                     if let Some(pos) = self.find_tab_for_pane(pane_id) {
-                                        valid_lines.push(line.to_string());
                                         let inner = self.state.tab_name_overrides.entry(pos).or_default();
                                         if !inner.contains_key(&pane_id) && !payload.is_empty() {
                                             inner.insert(pane_id, payload.to_string());
@@ -386,16 +406,6 @@ impl State {
                                     }
                                 }
                             }
-                        }
-                        // Rewrite state file with only valid entries (cleanup dead panes)
-                        if let Some(ref session) = self.state.mode.session_name {
-                            let content = valid_lines.join("\n");
-                            let cmd = format!(
-                                "printf '%s\\n' '{}' > /tmp/zjstatus-{}.state",
-                                content.replace('\'', "'\\''"),
-                                session
-                            );
-                            run_command(&["sh", "-c", &cmd], BTreeMap::new());
                         }
                         self.ensure_timer();
                         self.state.cache_mask = UpdateEventMask::Tab as u8;
@@ -457,6 +467,27 @@ impl State {
 
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
+
+                // Rebuild overrides with correct tab positions (positions shift when tabs are closed)
+                let mut new_overrides: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                for (_, inner) in std::mem::take(&mut self.state.tab_name_overrides) {
+                    for (pane_id, value) in inner {
+                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                            new_overrides.entry(new_pos).or_default().insert(pane_id, value);
+                        }
+                    }
+                }
+                self.state.tab_name_overrides = new_overrides;
+
+                let mut new_fallbacks: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                for (_, inner) in std::mem::take(&mut self.state.tab_name_fallbacks) {
+                    for (pane_id, value) in inner {
+                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                            new_fallbacks.entry(new_pos).or_default().insert(pane_id, value);
+                        }
+                    }
+                }
+                self.state.tab_name_fallbacks = new_fallbacks;
 
                 self.resolve_pending_overrides();
                 self.maybe_sync_from_host();

@@ -432,29 +432,7 @@ impl TabsWidget {
             }
         }
 
-        // No override: use focused pane title (🤖 prefix if Claude detected)
-        let non_plugin: Vec<_> = tab_panes
-            .map(|ps| ps.iter().filter(|p| !p.is_plugin).collect())
-            .unwrap_or_default();
-
-        let focused = non_plugin
-            .iter()
-            .find(|p| p.is_focused)
-            .or(non_plugin.first());
-
-        if let Some(pane) = focused {
-            let (title, is_claude) = strip_spinner_prefix(&pane.title);
-            if !title.is_empty() {
-                let truncated = self.truncate_name_dynamic(&title, name_max_len);
-                return if is_claude {
-                    format!("🤖 {}", truncated)
-                } else {
-                    truncated
-                };
-            }
-        }
-
-        // Fallback to zellij tab name
+        // No override: use zellij tab name
         tab.name.clone()
     }
 
