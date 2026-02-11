@@ -113,6 +113,15 @@ impl ZellijPlugin for State {
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         // Handle "title" pipe for tab naming
         if pipe_message.name == "title" {
+            // If a session arg is provided, verify it matches this session
+            if let Some(target_session) = pipe_message.args.get("session") {
+                if let Some(ref current_session) = self.state.mode.session_name {
+                    if target_session != current_session {
+                        return false;
+                    }
+                }
+            }
+
             if let Some(payload) = pipe_message.payload {
                 let pane_id = pipe_message
                     .args
@@ -260,20 +269,22 @@ impl State {
     }
 
     fn maybe_sync_from_host(&mut self) {
-        if !self.synced_from_host
-            && !self.state.tabs.is_empty()
-            && !self.state.panes.panes.is_empty()
+        if self.synced_from_host
+            || self.state.tabs.is_empty()
+            || self.state.panes.panes.is_empty()
         {
-            self.synced_from_host = true;
-            run_command(
-                &[
-                    "sh",
-                    "-c",
-                    "for f in /tmp/zjstatus-pane-*; do [ -f \"$f\" ] && id=\"${f##*-}\" && printf '%s:%s\\n' \"$id\" \"$(cat \"$f\")\"; done",
-                ],
-                BTreeMap::from([("name".to_string(), "sync_overrides".to_string())]),
-            );
+            return;
         }
+        let session = match &self.state.mode.session_name {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.synced_from_host = true;
+        let cmd = format!("cat /tmp/zjstatus-{}.state 2>/dev/null || true", session);
+        run_command(
+            &["sh", "-c", &cmd],
+            BTreeMap::from([("name".to_string(), "sync_overrides".to_string())]),
+        );
     }
 
     fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
@@ -353,20 +364,38 @@ impl State {
 
                 if let Some(name) = context.get("name") {
                     if name == "sync_overrides" {
+                        // Format: pane_id<TAB>fallback<TAB>payload
                         let stdout = String::from_utf8(stdout).unwrap_or_default();
+                        let mut valid_lines = Vec::new();
                         for line in stdout.lines() {
-                            if let Some((id_str, payload)) = line.split_once(':') {
-                                if let Ok(pane_id) = id_str.parse::<u32>() {
+                            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                            if parts.len() >= 3 {
+                                if let Ok(pane_id) = parts[0].parse::<u32>() {
+                                    let fallback = parts[1];
+                                    let payload = parts[2];
                                     if let Some(pos) = self.find_tab_for_pane(pane_id) {
+                                        valid_lines.push(line.to_string());
                                         let inner = self.state.tab_name_overrides.entry(pos).or_default();
-                                        if !inner.contains_key(&pane_id)
-                                            && !payload.is_empty()
-                                        {
+                                        if !inner.contains_key(&pane_id) && !payload.is_empty() {
                                             inner.insert(pane_id, payload.to_string());
+                                        }
+                                        if !fallback.is_empty() {
+                                            self.state.tab_name_fallbacks.entry(pos).or_default()
+                                                .insert(pane_id, fallback.to_string());
                                         }
                                     }
                                 }
                             }
+                        }
+                        // Rewrite state file with only valid entries (cleanup dead panes)
+                        if let Some(ref session) = self.state.mode.session_name {
+                            let content = valid_lines.join("\n");
+                            let cmd = format!(
+                                "printf '%s\\n' '{}' > /tmp/zjstatus-{}.state",
+                                content.replace('\'', "'\\''"),
+                                session
+                            );
+                            run_command(&["sh", "-c", &cmd], BTreeMap::new());
                         }
                         self.ensure_timer();
                         self.state.cache_mask = UpdateEventMask::Tab as u8;
