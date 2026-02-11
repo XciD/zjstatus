@@ -1,8 +1,21 @@
 use zellij_tile::prelude::*;
 
 use chrono::Local;
+use std::io::Write;
 use std::{collections::BTreeMap, sync::Arc};
 use uuid::Uuid;
+
+const ZELLIJ_BIN: &str = "/Users/xcid/.cargo/bin/zellij";
+
+fn debug_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/host/.zjstatus-debug.log")
+    {
+        let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+    }
+}
 
 use zjstatus::{
     config::{self, ModuleConfig, UpdateEventMask, ZellijState},
@@ -32,6 +45,7 @@ struct State {
     timer_active: bool,
     pending_pipe_overrides: Vec<(u32, String, Option<String>)>,
     synced_from_host: bool,
+    last_tab_count: usize,
 }
 
 #[cfg(not(test))]
@@ -111,6 +125,8 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        debug_log(&format!("PIPE: name={} args={:?}", pipe_message.name, pipe_message.args));
+
         // Handle "title" pipe for tab naming
         if pipe_message.name == "title" {
             // If a session arg is provided, verify it matches this session
@@ -290,23 +306,32 @@ impl State {
         }
     }
 
-    fn maybe_sync_from_host(&mut self) {
-        if self.synced_from_host
-            || self.state.tabs.is_empty()
-            || self.state.panes.panes.is_empty()
-        {
-            return;
-        }
+    fn broadcast_state_cli(&self) {
         let session = match &self.state.mode.session_name {
-            Some(s) => s.clone(),
+            Some(s) => s,
             None => return,
         };
-        self.synced_from_host = true;
-        let cmd = format!("cat /tmp/zjstatus-{}.state 2>/dev/null || true", session);
-        run_command(
-            &["sh", "-c", &cmd],
-            BTreeMap::from([("name".to_string(), "sync_overrides".to_string())]),
-        );
+        if self.state.tab_name_overrides.is_empty() {
+            debug_log("BROADCAST CLI: no overrides to send");
+            return;
+        }
+        debug_log(&format!("BROADCAST CLI: {} tabs with overrides", self.state.tab_name_overrides.len()));
+        for (_tab_pos, inner) in &self.state.tab_name_overrides {
+            for (pane_id, payload) in inner {
+                let fallback = self.state.tab_name_fallbacks
+                    .values()
+                    .flat_map(|m| m.get(pane_id))
+                    .next()
+                    .cloned()
+                    .unwrap_or_default();
+                debug_log(&format!("  CLI pipe: pane_id={} payload={}", pane_id, payload));
+                let args = format!("pane_id={},fallback={},session={}", pane_id, fallback, session);
+                run_command(
+                    &[ZELLIJ_BIN, "pipe", "--name", "title", "--args", &args, "--", payload],
+                    BTreeMap::new(),
+                );
+            }
+        }
     }
 
     fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
@@ -365,7 +390,6 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
 
                 self.resolve_pending_overrides();
-                self.maybe_sync_from_host();
                 self.ensure_timer();
 
                 should_render = true;
@@ -465,6 +489,14 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::TabUpdate");
                 tracing::debug!(tab_count = ?tab_info.len());
 
+                // Detect new tab and broadcast state via CLI
+                let new_tab_count = tab_info.len();
+                if new_tab_count > self.last_tab_count && self.last_tab_count > 0 {
+                    debug_log(&format!("NEW TAB: {} -> {}", self.last_tab_count, new_tab_count));
+                    self.broadcast_state_cli();
+                }
+                self.last_tab_count = new_tab_count;
+
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
@@ -490,7 +522,6 @@ impl State {
                 self.state.tab_name_fallbacks = new_fallbacks;
 
                 self.resolve_pending_overrides();
-                self.maybe_sync_from_host();
                 self.ensure_timer();
 
                 should_render = true;
