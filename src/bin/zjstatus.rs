@@ -1,21 +1,10 @@
 use zellij_tile::prelude::*;
 
 use chrono::Local;
-use std::io::Write;
 use std::{collections::BTreeMap, sync::Arc};
 use uuid::Uuid;
 
-const ZELLIJ_BIN: &str = "/Users/xcid/.cargo/bin/zellij";
-
-fn debug_log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/host/.zjstatus-debug.log")
-    {
-        let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
-    }
-}
+const LOADER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 use zjstatus::{
     config::{self, ModuleConfig, UpdateEventMask, ZellijState},
@@ -44,8 +33,14 @@ struct State {
     err: Option<anyhow::Error>,
     timer_active: bool,
     pending_pipe_overrides: Vec<(u32, String, Option<String>)>,
-    synced_from_host: bool,
-    last_tab_count: usize,
+    sync_requested: bool,
+    sync_complete: bool,
+    last_render_output: String,
+    render_dirty: bool,
+    last_timer_ts: i64,
+    last_good_cols: usize,
+    pending_small_cols: Option<usize>,
+    small_cols_seen: u8,
 }
 
 #[cfg(not(test))]
@@ -54,6 +49,8 @@ register_plugin!(State);
 #[cfg(feature = "tracing")]
 fn init_tracing() {
     use std::fs::File;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::Layer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     let file = File::create("/host/.zjstatus.log");
@@ -61,7 +58,9 @@ fn init_tracing() {
         Ok(file) => file,
         Err(error) => panic!("Error: {:?}", error),
     };
-    let debug_log = tracing_subscriber::fmt::layer().with_writer(Arc::new(file));
+    let debug_log = tracing_subscriber::fmt::layer()
+        .with_writer(Arc::new(file))
+        .with_filter(LevelFilter::DEBUG);
 
     tracing_subscriber::registry().with(debug_log).init();
 
@@ -80,6 +79,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         subscribe(&[
@@ -88,7 +88,6 @@ impl ZellijPlugin for State {
             EventType::PaneUpdate,
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
-            EventType::SessionUpdate,
             EventType::RunCommandResult,
             EventType::Timer,
         ]);
@@ -108,6 +107,9 @@ impl ZellijPlugin for State {
 
         self.state = ZellijState {
             cols: 0,
+            right_width: 0,
+            tabs_available: None,
+            suppress_tabs: false,
             command_results: BTreeMap::new(),
             pipe_results: BTreeMap::new(),
             mode: ModeInfo::default(),
@@ -122,10 +124,23 @@ impl ZellijPlugin for State {
             tab_name_fallbacks: BTreeMap::new(),
             spinner_idx: 0,
         };
+
+        set_timeout(0.1); // start loader animation
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        debug_log(&format!("PIPE: name={} args={:?}", pipe_message.name, pipe_message.args));
+        // Handle sync request: respond only to the requester plugin
+        if pipe_message.name == "zjstatus_sync" {
+            if let Some(source_str) = pipe_message.args.get("source_plugin_id") {
+                if let Ok(source_id) = source_str.parse::<u32>() {
+                    let my_id = get_plugin_ids().plugin_id;
+                    if source_id != my_id && !self.state.tab_name_overrides.is_empty() {
+                        self.send_state_to(source_id);
+                    }
+                }
+            }
+            return false;
+        }
 
         // Handle "title" pipe for tab naming
         if pipe_message.name == "title" {
@@ -167,6 +182,7 @@ impl ZellijPlugin for State {
                         }
                         self.state.tab_name_fallbacks.retain(|_, m| !m.is_empty());
                         self.state.cache_mask = UpdateEventMask::Tab as u8;
+                        self.render_dirty = true;
                         return true;
                     }
                     return false;
@@ -180,6 +196,7 @@ impl ZellijPlugin for State {
                     }
                     self.ensure_timer();
                     self.state.cache_mask = UpdateEventMask::Tab as u8;
+                    self.render_dirty = true;
                     return true;
                 }
             }
@@ -216,16 +233,17 @@ impl ZellijPlugin for State {
             }
         }
 
+        if should_render {
+            self.render_dirty = true;
+        }
         should_render
     }
 
-    #[tracing::instrument(skip_all, fields(event_type))]
     fn update(&mut self, event: Event) -> bool {
         if let Event::PermissionRequestResult(PermissionStatus::Granted) = event {
             self.got_permissions = true;
 
             while !self.pending_events.is_empty() {
-                tracing::debug!("processing cached event");
                 let ev = self.pending_events.pop();
 
                 self.handle_event(ev.unwrap());
@@ -233,7 +251,6 @@ impl ZellijPlugin for State {
         }
 
         if !self.got_permissions {
-            tracing::debug!("caching event");
             self.pending_events.push(event);
 
             return false;
@@ -242,7 +259,6 @@ impl ZellijPlugin for State {
         self.handle_event(event)
     }
 
-    #[tracing::instrument(skip_all)]
     fn render(&mut self, _rows: usize, cols: usize) {
         if !self.got_permissions {
             return;
@@ -254,32 +270,88 @@ impl ZellijPlugin for State {
             return;
         }
 
+        if !self.sync_complete {
+            let frame = LOADER_FRAMES[self.state.spinner_idx % LOADER_FRAMES.len()];
+            print!("{}", frame);
+            return;
+        }
+
+        if !self.is_in_active_tab() {
+            return;
+        }
+
+        let prev_cols = self.state.cols;
+        if self.last_good_cols == 0 {
+            self.last_good_cols = prev_cols.max(cols);
+        }
+
+        if cols < self.last_good_cols
+            && !self.last_render_output.is_empty()
+            && self.last_good_cols.saturating_sub(cols) > 10
+        {
+            if self.pending_small_cols != Some(cols) {
+                self.pending_small_cols = Some(cols);
+                self.small_cols_seen = 1;
+            } else {
+                self.small_cols_seen = self.small_cols_seen.saturating_add(1);
+            }
+
+            if self.small_cols_seen < 2 {
+                tracing::debug!(
+                    cols,
+                    last_good_cols = self.last_good_cols,
+                    "render: transient small cols"
+                );
+                set_timeout(0.1);
+                print!("{}", self.last_render_output);
+                return;
+            }
+        }
+
+        self.pending_small_cols = None;
+        self.small_cols_seen = 0;
+        self.last_good_cols = cols;
+
+        let cols_changed = prev_cols != cols;
         self.state.cols = cols;
 
-        self.ensure_timer();
+        if !self.render_dirty && !cols_changed && !self.last_render_output.is_empty() {
+            tracing::debug!("render: cached");
+            print!("{}", self.last_render_output);
+            return;
+        }
 
-        tracing::debug!("{:?}", self.state.mode.session_name);
+        tracing::debug!(dirty = self.render_dirty, cols_changed, "render: recompute");
+
+        self.render_dirty = false;
+        self.ensure_timer();
 
         let output = self
             .module_config
-            .render_bar(self.state.clone(), self.widget_map.clone());
+            .render_bar(&mut self.state, &self.widget_map);
 
+        self.last_render_output = output.clone();
+        self.state.cache_mask = 0;
         print!("{}", output);
     }
 }
 
 impl State {
     fn ensure_timer(&mut self) {
-        if !self.timer_active
-            && self
-                .state
-                .tab_name_overrides
-                .values()
-                .flat_map(|m| m.values())
-                .any(|v| v.contains("{spin}"))
-        {
-            self.timer_active = true;
-            set_timeout(0.3);
+        if self.timer_active {
+            return;
+        }
+        self.timer_active = true;
+        let has_spin = self
+            .state
+            .tab_name_overrides
+            .values()
+            .flat_map(|m| m.values())
+            .any(|v| v.contains("{spin}"));
+        if has_spin {
+            set_timeout(0.4);
+        } else {
+            set_timeout(1.0);
         }
     }
 
@@ -306,16 +378,33 @@ impl State {
         }
     }
 
-    fn broadcast_state_cli(&self) {
+    /// Request sync from other plugins (called once when newly initialized).
+    /// Broadcasts to all plugins; responders use our plugin_id to reply targeted.
+    fn request_sync(&mut self) {
+        if self.sync_requested
+            || self.state.tabs.is_empty()
+            || self.state.panes.panes.is_empty()
+        {
+            return;
+        }
+        self.sync_requested = true;
+        let my_id = get_plugin_ids().plugin_id;
+        let mut args = BTreeMap::new();
+        args.insert("source_plugin_id".to_string(), my_id.to_string());
+        pipe_message_to_plugin(
+            MessageToPlugin::new("zjstatus_sync")
+                .with_payload("sync")
+                .with_args(args),
+        );
+        set_timeout(0.3); // wait for sync responses before rendering bar
+    }
+
+    /// Send current overrides to a specific plugin instance
+    fn send_state_to(&self, target_plugin_id: u32) {
         let session = match &self.state.mode.session_name {
             Some(s) => s,
             None => return,
         };
-        if self.state.tab_name_overrides.is_empty() {
-            debug_log("BROADCAST CLI: no overrides to send");
-            return;
-        }
-        debug_log(&format!("BROADCAST CLI: {} tabs with overrides", self.state.tab_name_overrides.len()));
         for (_tab_pos, inner) in &self.state.tab_name_overrides {
             for (pane_id, payload) in inner {
                 let fallback = self.state.tab_name_fallbacks
@@ -324,14 +413,32 @@ impl State {
                     .next()
                     .cloned()
                     .unwrap_or_default();
-                debug_log(&format!("  CLI pipe: pane_id={} payload={}", pane_id, payload));
-                let args = format!("pane_id={},fallback={},session={}", pane_id, fallback, session);
-                run_command(
-                    &[ZELLIJ_BIN, "pipe", "--name", "title", "--args", &args, "--", payload],
-                    BTreeMap::new(),
+                let mut args = BTreeMap::new();
+                args.insert("pane_id".to_string(), pane_id.to_string());
+                args.insert("fallback".to_string(), fallback);
+                args.insert("session".to_string(), session.clone());
+                // Replace {spin} with static symbol so synced instances don't run timers
+                let synced_payload = payload.replace("{spin}", "●");
+                pipe_message_to_plugin(
+                    MessageToPlugin::new("title")
+                        .with_destination_plugin_id(target_plugin_id)
+                        .with_payload(synced_payload)
+                        .with_args(args),
                 );
             }
         }
+    }
+
+    fn tabs_changed(&self, new_tabs: &[TabInfo]) -> bool {
+        if self.state.tabs.len() != new_tabs.len() {
+            return true;
+        }
+        for (old, new) in self.state.tabs.iter().zip(new_tabs.iter()) {
+            if old.name != new.name || old.active != new.active || old.position != new.position {
+                return true;
+            }
+        }
+        false
     }
 
     fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
@@ -345,33 +452,44 @@ impl State {
         None
     }
 
+    fn is_in_active_tab(&self) -> bool {
+        if self.state.tabs.is_empty() || self.state.panes.panes.is_empty() {
+            return true; // early startup: allow initial render
+        }
+
+        let my_id = get_plugin_ids().plugin_id;
+        for tab in &self.state.tabs {
+            if let Some(panes) = self.state.panes.panes.get(&tab.position) {
+                if panes.iter().any(|p| p.is_plugin && p.id == my_id) {
+                    return tab.active;
+                }
+            }
+        }
+
+        false // default to inactive once panes/tabs are known
+    }
+
     fn handle_event(&mut self, event: Event) -> bool {
         let mut should_render = false;
+        let mut evt_name = "Other";
         match event {
             Event::Mouse(mouse_info) => {
-                tracing::Span::current().record("event_type", "Event::Mouse");
-                tracing::debug!(mouse = ?mouse_info);
-
+                evt_name = "Mouse";
                 self.module_config.handle_mouse_action(
-                    self.state.clone(),
+                    &self.state,
                     mouse_info,
-                    self.widget_map.clone(),
+                    &self.widget_map,
                 );
             }
             Event::ModeUpdate(mode_info) => {
-                tracing::Span::current().record("event_type", "Event::ModeUpdate");
-                tracing::debug!(mode = ?mode_info.mode);
-                tracing::debug!(mode = ?mode_info.session_name);
-
+                evt_name = "ModeUpdate";
                 self.state.mode = mode_info;
                 self.state.cache_mask = UpdateEventMask::Mode as u8;
 
-                should_render = true;
+                should_render = self.is_in_active_tab();
             }
             Event::PaneUpdate(pane_info) => {
-                tracing::Span::current().record("event_type", "Event::PaneUpdate");
-                tracing::debug!(pane_count = ?pane_info.panes.len());
-
+                evt_name = "PaneUpdate";
                 frames::hide_frames_conditionally(
                     &frames::FrameConfig::new(
                         self.module_config.hide_frame_for_single_pane,
@@ -387,167 +505,153 @@ impl State {
                 );
 
                 self.state.panes = pane_info;
-                self.state.cache_mask = UpdateEventMask::Tab as u8;
 
+                let had_pending = !self.pending_pipe_overrides.is_empty();
                 self.resolve_pending_overrides();
-                self.ensure_timer();
+                self.request_sync();
 
-                should_render = true;
+                // Only re-render if pending overrides were resolved
+                if had_pending {
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+                    let active = self.is_in_active_tab();
+                    if active {
+                        self.ensure_timer();
+                    }
+                    should_render = active;
+                }
             }
             Event::PermissionRequestResult(result) => {
-                tracing::Span::current().record("event_type", "Event::PermissionRequestResult");
-                tracing::debug!(result = ?result);
+                let _ = result;
                 set_selectable(false);
             }
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                tracing::Span::current().record("event_type", "Event::RunCommandResult");
-                tracing::debug!(
-                    exit_code = ?exit_code,
-                    stdout = ?String::from_utf8(stdout.clone()),
-                    stderr = ?String::from_utf8(stderr.clone()),
-                    context = ?context
-                );
-
+                evt_name = "RunCommandResult";
                 if let Some(name) = context.get("name") {
-                    if name == "sync_overrides" {
-                        // Format: pane_id<TAB>fallback<TAB>payload
-                        let stdout = String::from_utf8(stdout).unwrap_or_default();
-                        for line in stdout.lines() {
-                            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-                            if parts.len() >= 3 {
-                                if let Ok(pane_id) = parts[0].parse::<u32>() {
-                                    let fallback = parts[1];
-                                    let payload = parts[2];
-                                    if let Some(pos) = self.find_tab_for_pane(pane_id) {
-                                        let inner = self.state.tab_name_overrides.entry(pos).or_default();
-                                        if !inner.contains_key(&pane_id) && !payload.is_empty() {
-                                            inner.insert(pane_id, payload.to_string());
-                                        }
-                                        if !fallback.is_empty() {
-                                            self.state.tab_name_fallbacks.entry(pos).or_default()
-                                                .insert(pane_id, fallback.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        self.ensure_timer();
-                        self.state.cache_mask = UpdateEventMask::Tab as u8;
-                        should_render = true;
-                    } else {
-                        self.state.cache_mask = UpdateEventMask::Command as u8;
+                    self.state.cache_mask = UpdateEventMask::Command as u8;
 
-                        let stdout = match String::from_utf8(stdout) {
-                            Ok(s) => s,
-                            Err(_) => "".to_owned(),
-                        };
+                    let stdout = match String::from_utf8(stdout) {
+                        Ok(s) => s,
+                        Err(_) => "".to_owned(),
+                    };
 
-                        let stderr = match String::from_utf8(stderr) {
-                            Ok(s) => s,
-                            Err(_) => "".to_owned(),
-                        };
+                    let stderr = match String::from_utf8(stderr) {
+                        Ok(s) => s,
+                        Err(_) => "".to_owned(),
+                    };
 
-                        self.state.command_results.insert(
-                            name.to_owned(),
-                            CommandResult {
-                                exit_code,
-                                stdout,
-                                stderr,
-                                context,
-                            },
-                        );
-                    }
-                }
-            }
-            Event::SessionUpdate(session_info, _) => {
-                tracing::Span::current().record("event_type", "Event::SessionUpdate");
-
-                let current_session = session_info.iter().find(|s| s.is_current_session);
-
-                if let Some(current_session) = current_session {
-                    frames::hide_frames_conditionally(
-                        &frames::FrameConfig::new(
-                            self.module_config.hide_frame_for_single_pane,
-                            self.module_config.hide_frame_except_for_search,
-                            self.module_config.hide_frame_except_for_fullscreen,
-                            self.module_config.hide_frame_except_for_scroll,
-                        ),
-                        &current_session.tabs,
-                        &current_session.panes,
-                        &self.state.mode,
-                        get_plugin_ids(),
-                        false,
+                    self.state.command_results.insert(
+                        name.to_owned(),
+                        CommandResult {
+                            exit_code,
+                            stdout,
+                            stderr,
+                            context,
+                        },
                     );
+                    should_render = self.is_in_active_tab();
                 }
-
-                self.state.sessions = session_info;
-                self.state.cache_mask = UpdateEventMask::Session as u8;
-
-                should_render = true;
             }
             Event::TabUpdate(tab_info) => {
-                tracing::Span::current().record("event_type", "Event::TabUpdate");
-                tracing::debug!(tab_count = ?tab_info.len());
-
-                // Detect new tab and broadcast state via CLI
-                let new_tab_count = tab_info.len();
-                if new_tab_count > self.last_tab_count && self.last_tab_count > 0 {
-                    debug_log(&format!("NEW TAB: {} -> {}", self.last_tab_count, new_tab_count));
-                    self.broadcast_state_cli();
-                }
-                self.last_tab_count = new_tab_count;
-
-                self.state.cache_mask = UpdateEventMask::Tab as u8;
+                evt_name = "TabUpdate";
+                let changed = self.tabs_changed(&tab_info);
                 self.state.tabs = tab_info;
 
-                // Rebuild overrides with correct tab positions (positions shift when tabs are closed)
-                let mut new_overrides: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
-                for (_, inner) in std::mem::take(&mut self.state.tab_name_overrides) {
-                    for (pane_id, value) in inner {
-                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
-                            new_overrides.entry(new_pos).or_default().insert(pane_id, value);
-                        }
-                    }
-                }
-                self.state.tab_name_overrides = new_overrides;
-
-                let mut new_fallbacks: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
-                for (_, inner) in std::mem::take(&mut self.state.tab_name_fallbacks) {
-                    for (pane_id, value) in inner {
-                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
-                            new_fallbacks.entry(new_pos).or_default().insert(pane_id, value);
-                        }
-                    }
-                }
-                self.state.tab_name_fallbacks = new_fallbacks;
-
+                // Always try sync/overrides resolution (needed at startup)
                 self.resolve_pending_overrides();
-                self.ensure_timer();
+                self.request_sync();
 
-                should_render = true;
+                if changed {
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+
+                    // Rebuild overrides with correct tab positions (positions shift when tabs are closed)
+                    let mut new_overrides: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                    for (_, inner) in std::mem::take(&mut self.state.tab_name_overrides) {
+                        for (pane_id, value) in inner {
+                            if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                                new_overrides.entry(new_pos).or_default().insert(pane_id, value);
+                            }
+                        }
+                    }
+                    self.state.tab_name_overrides = new_overrides;
+
+                    let mut new_fallbacks: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                    for (_, inner) in std::mem::take(&mut self.state.tab_name_fallbacks) {
+                        for (pane_id, value) in inner {
+                            if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                                new_fallbacks.entry(new_pos).or_default().insert(pane_id, value);
+                            }
+                        }
+                    }
+                    self.state.tab_name_fallbacks = new_fallbacks;
+
+                    let active = self.is_in_active_tab();
+                    if active {
+                        self.ensure_timer();
+                    }
+                    should_render = active;
+                }
             }
             Event::Timer(_) => {
-                tracing::Span::current().record("event_type", "Event::Timer");
-
+                evt_name = "Timer";
                 self.state.spinner_idx = self.state.spinner_idx.wrapping_add(1);
-                self.state.cache_mask = UpdateEventMask::Tab as u8;
 
-                // Keep the timer running while any override contains {spin}
-                let has_spin = self
-                    .state
-                    .tab_name_overrides
-                    .values()
-                    .flat_map(|m| m.values())
-                    .any(|v| v.contains("{spin}"));
-                if has_spin {
-                    set_timeout(0.3);
-                } else {
-                    self.timer_active = false;
+                // During sync, only run the sync timer — don't start the active tab timer
+                let mut syncing = false;
+                if !self.sync_complete {
+                    if self.sync_requested && self.state.spinner_idx >= 3 {
+                        self.sync_complete = true;
+                    } else if self.state.spinner_idx > 10 {
+                        self.sync_complete = true;
+                    } else {
+                        set_timeout(0.1);
+                        should_render = true; // animate loading spinner
+                        syncing = true;
+                    }
                 }
-                should_render = true;
+
+                if !syncing {
+                    let now = Local::now().timestamp_millis();
+                    // Drain stacked timers: skip if fired too recently
+                    if now - self.last_timer_ts < 300 {
+                        // Stacked timer — consume without rescheduling
+                        self.timer_active = false;
+                    } else if self.is_in_active_tab() {
+                        self.last_timer_ts = now;
+                        self.state.cache_mask = UpdateEventMask::Tab as u8;
+
+                        // Schedule command re-execution without invalidating widget caches
+                        if let Some(cmd_widget) = self.widget_map.get("command") {
+                            cmd_widget.tick(&self.state);
+                        }
+                        let has_spin = self
+                            .state
+                            .tab_name_overrides
+                            .values()
+                            .flat_map(|m| m.values())
+                            .any(|v| v.contains("{spin}"));
+                        if has_spin {
+                            set_timeout(0.4);
+                            should_render = true;
+                        } else {
+                            set_timeout(1.0);
+                            // No render needed — RunCommandResult will trigger render
+                        }
+                    } else {
+                        self.timer_active = false;
+                    }
+                }
             }
             _ => (),
         };
+        if should_render {
+            self.render_dirty = true;
+            tracing::debug!(
+                evt_name,
+                plugin_id = get_plugin_ids().plugin_id,
+                cache_mask = self.state.cache_mask,
+                "handle_event: dirty"
+            );
+        }
         should_render
     }
 }
@@ -578,8 +682,6 @@ fn register_widgets(configuration: &BTreeMap<String, String>) -> BTreeMap<String
         "notifications".to_owned(),
         Arc::new(NotificationWidget::new(configuration)),
     );
-
-    tracing::debug!("registered widgets: {:?}", widget_map.keys());
 
     widget_map
 }

@@ -14,6 +14,9 @@ use chrono::{DateTime, Local};
 #[derive(Default, Debug, Clone)]
 pub struct ZellijState {
     pub cols: usize,
+    pub right_width: usize,
+    pub tabs_available: Option<usize>,
+    pub suppress_tabs: bool,
     pub command_results: BTreeMap<String, CommandResult>,
     pub pipe_results: BTreeMap<String, String>,
     pub mode: ModeInfo,
@@ -63,7 +66,7 @@ pub enum UpdateEventMask {
 
 pub fn event_mask_from_widget_name(name: &str) -> u8 {
     match name {
-        "command" => UpdateEventMask::Always as u8,
+        "command" => UpdateEventMask::Command as u8,
         "datetime" => UpdateEventMask::Always as u8,
         "mode" => UpdateEventMask::Mode as u8,
         "notifications" => UpdateEventMask::Always as u8,
@@ -177,9 +180,9 @@ impl ModuleConfig {
 
     pub fn handle_mouse_action(
         &mut self,
-        state: ZellijState,
+        state: &ZellijState,
         mouse: Mouse,
-        widget_map: BTreeMap<String, Arc<dyn Widget>>,
+        widget_map: &BTreeMap<String, Arc<dyn Widget>>,
     ) {
         let click_pos = match mouse {
             Mouse::ScrollUp(_) => return,
@@ -332,22 +335,56 @@ impl ModuleConfig {
 
     pub fn render_bar(
         &mut self,
-        state: ZellijState,
-        widget_map: BTreeMap<String, Arc<dyn Widget>>,
+        state: &mut ZellijState,
+        widget_map: &BTreeMap<String, Arc<dyn Widget>>,
     ) -> String {
         if self.left_parts.is_empty() && self.center_parts.is_empty() && self.right_parts.is_empty()
         {
             return "No configuration found. See https://github.com/dj95/zjstatus/wiki/3-%E2%80%90-Configuration for more info".to_string();
         }
 
-        let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
+        let mut output_right = self
+            .right_parts
+            .iter_mut()
+            .fold("".to_owned(), |acc, part| {
+                format!(
+                    "{acc}{}",
+                    part.format_string_with_widgets(&widget_map, &state)
+                )
+            });
+        state.right_width = console::measure_text_width(&output_right);
+        tracing::debug!(right_width = state.right_width, "layout right_width");
+
+        state.suppress_tabs = true;
+        let left_without_tabs = self
+            .left_parts
+            .iter()
+            .map(|part| {
+                let mut tmp = part.clone();
+                tmp.format_string_with_widgets(&widget_map, &state)
+            })
+            .collect::<String>();
+        state.suppress_tabs = false;
+        state.tabs_available = Some(
+            state
+                .cols
+                .saturating_sub(state.right_width)
+                .saturating_sub(console::measure_text_width(&left_without_tabs)),
+        );
+        tracing::debug!(
+            left_without_tabs_width = console::measure_text_width(&left_without_tabs),
+            tabs_available = state.tabs_available,
+            "layout tabs_available"
+        );
+
+        let mut output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
             format!(
                 "{acc}{}",
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
 
-        let output_center = self
+        let mut output_center = self
             .center_parts
             .iter_mut()
             .fold("".to_owned(), |acc, part| {
@@ -357,20 +394,83 @@ impl ModuleConfig {
                 )
             });
 
-        let output_right = self
-            .right_parts
-            .iter_mut()
-            .fold("".to_owned(), |acc, part| {
+        let available = state.cols.saturating_sub(state.right_width);
+        if console::measure_text_width(&output_left) > available {
+            // Tabs couldn't fit even after truncation; drop right to reclaim space.
+            tracing::debug!("layout drop_right");
+            state.right_width = 0;
+            state.tabs_available = None;
+            output_right.clear();
+
+            state.suppress_tabs = true;
+            let left_without_tabs = self
+                .left_parts
+                .iter()
+                .map(|part| {
+                    let mut tmp = part.clone();
+                    tmp.format_string_with_widgets(&widget_map, &state)
+                })
+                .collect::<String>();
+            state.suppress_tabs = false;
+            state.tabs_available = Some(
+                state
+                    .cols
+                    .saturating_sub(console::measure_text_width(&left_without_tabs)),
+            );
+
+            output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
                 format!(
                     "{acc}{}",
                     part.format_string_with_widgets(&widget_map, &state)
                 )
             });
 
-        let (output_left, output_center, output_right) = match self.hide_on_overlength {
+            output_center = self
+                .center_parts
+                .iter_mut()
+                .fold("".to_owned(), |acc, part| {
+                    format!(
+                        "{acc}{}",
+                        part.format_string_with_widgets(&widget_map, &state)
+                    )
+                });
+        }
+
+        let raw_left = output_left.clone();
+        let raw_right = output_right.clone();
+        tracing::debug!(
+            raw_left_width = console::measure_text_width(&raw_left),
+            raw_center_width = console::measure_text_width(&output_center),
+            raw_right_width = console::measure_text_width(&raw_right),
+            cols = state.cols,
+            right_width = state.right_width,
+            tabs_available = state.tabs_available,
+            "layout raw widths"
+        );
+
+        let (mut output_left, mut output_center, mut output_right) = match self.hide_on_overlength {
             true => self.trim_output(&output_left, &output_center, &output_right, state.cols),
             false => (output_left, output_center, output_right),
         };
+
+        if !raw_right.is_empty() && output_right.is_empty() {
+            let left_w = console::measure_text_width(&raw_left);
+            let right_w = console::measure_text_width(&raw_right);
+            if left_w.saturating_add(right_w) <= state.cols {
+                tracing::debug!("layout keep right by dropping center");
+                output_left = raw_left;
+                output_center.clear();
+                output_right = raw_right;
+            }
+        }
+
+        state.right_width = console::measure_text_width(&output_right);
+        tracing::debug!(
+            left_width = console::measure_text_width(&output_left),
+            center_width = console::measure_text_width(&output_center),
+            right_width = console::measure_text_width(&output_right),
+            "layout trimmed widths"
+        );
 
         if self.border.enabled {
             let mut border_top = "".to_owned();

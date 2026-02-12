@@ -1,6 +1,7 @@
 use kdl::{KdlDocument, KdlError};
 use lazy_static::lazy_static;
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs::{File, remove_file},
     ops::Sub,
@@ -49,9 +50,16 @@ pub struct CommandResult {
     pub context: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedCommandOutput {
+    ts: String,
+    output: String,
+}
+
 pub struct CommandWidget {
     config: BTreeMap<String, CommandConfig>,
     zj_conf: BTreeMap<String, String>,
+    cache: RefCell<BTreeMap<String, CachedCommandOutput>>,
 }
 
 impl CommandWidget {
@@ -59,11 +67,18 @@ impl CommandWidget {
         Self {
             config: parse_config(config),
             zj_conf: config.clone(),
+            cache: RefCell::new(BTreeMap::new()),
         }
     }
 }
 
 impl Widget for CommandWidget {
+    fn tick(&self, state: &ZellijState) {
+        for (name, command_config) in &self.config {
+            run_command_if_needed(command_config.clone(), name, state);
+        }
+    }
+
     fn process(&self, name: &str, state: &ZellijState) -> String {
         let command_config = match self.config.get(name) {
             Some(cc) => cc,
@@ -81,8 +96,24 @@ impl Widget for CommandWidget {
             }
         };
 
+        let ts_context = command_result.context.get("timestamp").cloned();
+        if let Some(ref ts) = ts_context {
+            if let Some(cached) = self.cache.borrow().get(name) {
+                if cached.ts == *ts {
+                    return cached.output.clone();
+                }
+            }
+        }
+
         if command_config.hide_on_empty_stdout && command_result.stdout.is_empty() {
-            return "".to_owned();
+            let output = "".to_owned();
+            if let Some(ts) = ts_context {
+                self.cache.borrow_mut().insert(
+                    name.to_owned(),
+                    CachedCommandOutput { ts, output: output.clone() },
+                );
+            }
+            return output;
         }
 
         let content = command_config
@@ -128,7 +159,7 @@ impl Widget for CommandWidget {
                 format!("{acc}{}", content)
             });
 
-        match command_config.render_mode {
+        let output = match command_config.render_mode {
             RenderMode::Static => content,
             RenderMode::Dynamic => render_dynamic_formatted_content(&content, &self.zj_conf),
             RenderMode::Raw => command_result
@@ -136,7 +167,16 @@ impl Widget for CommandWidget {
                 .strip_suffix('\n')
                 .unwrap_or(&command_result.stdout)
                 .to_owned(),
+        };
+
+        if let Some(ts) = ts_context {
+            self.cache.borrow_mut().insert(
+                name.to_owned(),
+                CachedCommandOutput { ts, output: output.clone() },
+            );
         }
+
+        output
     }
 
     fn process_click(&self, name: &str, _state: &ZellijState, _pos: usize) {

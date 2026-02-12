@@ -42,7 +42,7 @@ fn bench_moduleconfig_render_bar(c: &mut Criterion) {
         Arc::new(SessionWidget::new(&BTreeMap::from([]))),
     );
 
-    let state = ZellijState {
+    let mut state = ZellijState {
         mode: ModeInfo::default(),
         tabs: vec![TabInfo {
             name: "test".to_owned(),
@@ -53,7 +53,7 @@ fn bench_moduleconfig_render_bar(c: &mut Criterion) {
     };
 
     c.bench_function("ModuleConfig::render_bar", |b| {
-        b.iter(|| module_config.render_bar(state.clone(), widgets.clone()))
+        b.iter(|| module_config.render_bar(&mut state, &widgets))
     });
 }
 

@@ -42,9 +42,15 @@ zellij pipe --name focus --args "pane_id=${ZELLIJ_PANE_ID},session=${ZELLIJ_SESS
 
 This switches to the correct tab AND focuses the pane.
 
-### State persistence
+### State sync between plugin instances
 
-Overrides are persisted to `/tmp/zjstatus-${session}.state` so new zjstatus instances can restore state on startup.
+New zjstatus instances broadcast a `zjstatus_sync` pipe message on startup. Existing instances respond with their tab name overrides targeted to the requester via `destination_plugin_id`, avoiding N² message storms.
+
+### Performance
+
+- **Render caching**: Output is cached and reused when nothing changed (no event, no resize)
+- **Active-tab-only rendering**: Inactive tabs skip rendering entirely
+- **Transient resize filtering**: Brief col-count drops (e.g. during tab creation) are debounced
 
 ### Tab position stability
 

@@ -12,6 +12,14 @@ use crate::{config::ZellijState, render::FormattedPart};
 use super::widget::Widget;
 
 const SPINNER_FRAMES: &[&str] = &["✦", "✶", "✽", "✶"];
+const MIN_TAB_NAME_LEN: usize = 5;
+
+struct TabLayout {
+    truncated_start: usize,
+    truncated_end: usize,
+    tabs: Vec<TabInfo>,
+    names: Vec<String>,
+}
 
 /// Strip leading spinner prefix (e.g. "⠋ " or "● ") from pane titles.
 /// Returns (stripped_text, had_prefix).
@@ -126,69 +134,23 @@ impl TabsWidget {
 
 impl Widget for TabsWidget {
     fn process(&self, _name: &str, state: &ZellijState) -> String {
-        let mut output = "".to_owned();
-        let mut counter = 0;
-
-        let (truncated_start, truncated_end, tabs) =
-            get_tab_window(&state.tabs, self.tab_display_count);
-
-        // ~6 chars overhead per tab (index, spaces, formatting)
-        let per_tab_overhead = 6;
-        let name_max_len = if !tabs.is_empty() && state.cols > 0 {
-            let available = state.cols.saturating_sub(tabs.len() * per_tab_overhead);
-            let dynamic = available / tabs.len();
-            cmp::max(5, dynamic)
-        } else {
-            self.tab_name_max_len
-        };
-
-        if truncated_start > 0 {
-            for f in &self.tab_truncate_start_format {
-                let mut content = f.content.clone();
-
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_start).to_string().as_str());
-                }
-
-                output = format!("{output}{}", f.format_string(&content));
-            }
+        if state.suppress_tabs {
+            return "".to_owned();
         }
-
-        for tab in &tabs {
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx, name_max_len);
-            let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
-            counter += 1;
-
-            output = format!("{}{}", output, content);
-
-            if counter < tabs.len()
-                && let Some(sep) = &self.separator
-            {
-                output = format!("{}{}", output, sep.format_string(&sep.content));
-            }
-        }
-
-        if truncated_end > 0 {
-            for f in &self.tab_truncate_end_format {
-                let mut content = f.content.clone();
-
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
-                }
-
-                output = format!("{output}{}", f.format_string(&content));
-            }
-        }
-
-        output
+        let layout = self.compute_layout(state);
+        self.render_tabs_from_layout(state, &layout)
     }
 
     fn process_click(&self, _name: &str, state: &ZellijState, pos: usize) {
         let mut offset = 0;
         let mut counter = 0;
 
-        let (truncated_start, truncated_end, tabs) =
-            get_tab_window(&state.tabs, self.tab_display_count);
+        let layout = self.compute_layout(state);
+        let tabs = &layout.tabs;
+        let names = &layout.names;
+        if tabs.is_empty() {
+            return;
+        }
 
         let active_pos = &state
             .tabs
@@ -198,36 +160,30 @@ impl Widget for TabsWidget {
             .position
             + 1;
 
-        if truncated_start > 0 {
+        if layout.truncated_start > 0 {
             for f in &self.tab_truncate_start_format {
                 let mut content = f.content.clone();
 
                 if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
+                    content = content.replace(
+                        "{count}",
+                        (layout.truncated_start).to_string().as_str(),
+                    );
                 }
 
                 offset += console::measure_text_width(&f.format_string(&content));
 
                 if pos <= offset {
                     switch_tab_to(active_pos.saturating_sub(1) as u32);
+                    return;
                 }
             }
         }
 
-        let per_tab_overhead = 6;
-        let name_max_len = if !tabs.is_empty() && state.cols > 0 {
-            let available = state.cols.saturating_sub(tabs.len() * per_tab_overhead);
-            let dynamic = available / tabs.len();
-            cmp::max(5, dynamic)
-        } else {
-            self.tab_name_max_len
-        };
-
-        for tab in &tabs {
+        for (tab, display_name) in tabs.iter().zip(names.iter()) {
             counter += 1;
 
-            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx, name_max_len);
-            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
+            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, display_name);
 
             if counter < tabs.len()
                 && let Some(sep) = &self.separator
@@ -247,18 +203,20 @@ impl Widget for TabsWidget {
             offset += content_len;
         }
 
-        if truncated_end > 0 {
+        if layout.truncated_end > 0 {
             for f in &self.tab_truncate_end_format {
                 let mut content = f.content.clone();
 
                 if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
+                    content =
+                        content.replace("{count}", (layout.truncated_end).to_string().as_str());
                 }
 
                 offset += console::measure_text_width(&f.format_string(&content));
 
                 if pos <= offset {
                     switch_tab_to(cmp::min(active_pos + 1, state.tabs.len()) as u32);
+                    return;
                 }
             }
         }
@@ -292,6 +250,167 @@ impl TabsWidget {
         }
 
         &self.normal_tab_format
+    }
+
+    fn compute_layout(&self, state: &ZellijState) -> TabLayout {
+        let tab_count = state.tabs.len();
+        tracing::debug!(
+            tab_count,
+            cols = state.cols,
+            right_width = state.right_width,
+            tabs_available = state.tabs_available,
+            max_name = self.tab_name_max_len,
+            "tabs compute_layout"
+        );
+        if tab_count == 0 || state.cols == 0 {
+            return TabLayout {
+                truncated_start: 0,
+                truncated_end: 0,
+                tabs: Vec::new(),
+                names: Vec::new(),
+            };
+        }
+
+        let available = match state.tabs_available {
+            Some(avail) => avail,
+            None => state.cols.saturating_sub(state.right_width),
+        };
+        let min_len = MIN_TAB_NAME_LEN.min(self.tab_name_max_len);
+        let display_count = self.tab_display_count;
+
+        // Fast path: try full name length — fits in most cases
+        let layout = self.layout_for_name_len(state, display_count, self.tab_name_max_len);
+        let full_output = self.render_tabs_from_layout(state, &layout);
+        let full_width = console::measure_text_width(&full_output);
+        if full_width <= available {
+            return layout;
+        }
+
+        // Estimate chrome overhead (formatting, separators, truncation markers)
+        // and algebraically compute the target name length
+        let num_visible = layout.tabs.len();
+        if num_visible > 0 {
+            let total_name_width: usize =
+                layout.names.iter().map(|n| console::measure_text_width(n)).sum();
+            let chrome = full_width.saturating_sub(total_name_width);
+            let name_budget = available.saturating_sub(chrome);
+            let target_len = (name_budget / num_visible).clamp(min_len, self.tab_name_max_len);
+
+            if target_len >= min_len {
+                let layout = self.layout_for_name_len(state, display_count, target_len);
+                let width = console::measure_text_width(
+                    &self.render_tabs_from_layout(state, &layout),
+                );
+                if width <= available {
+                    return layout;
+                }
+                // Algebraic estimate missed (wide chars, emojis) — fall back to min
+                if target_len > min_len {
+                    let layout = self.layout_for_name_len(state, display_count, min_len);
+                    let width = console::measure_text_width(
+                        &self.render_tabs_from_layout(state, &layout),
+                    );
+                    if width <= available {
+                        return layout;
+                    }
+                }
+            }
+        }
+
+        // Names at min length don't fit — reduce visible tab count
+        for count in (1..tab_count).rev() {
+            let layout = self.layout_for_name_len(state, Some(count), self.tab_name_max_len);
+            let width =
+                console::measure_text_width(&self.render_tabs_from_layout(state, &layout));
+            if width <= available {
+                return layout;
+            }
+            let layout = self.layout_for_name_len(state, Some(count), min_len);
+            let width =
+                console::measure_text_width(&self.render_tabs_from_layout(state, &layout));
+            if width <= available {
+                return layout;
+            }
+        }
+
+        self.layout_for_name_len(state, Some(1), min_len)
+    }
+
+    fn layout_for_name_len(
+        &self,
+        state: &ZellijState,
+        display_count: Option<usize>,
+        name_max_len: usize,
+    ) -> TabLayout {
+        let (truncated_start, truncated_end, tabs) =
+            get_tab_window(&state.tabs, display_count);
+        let names = tabs
+            .iter()
+            .map(|tab| {
+                self.resolve_tab_name(
+                    tab,
+                    &state.panes,
+                    &state.tab_name_overrides,
+                    &state.tab_name_fallbacks,
+                    state.spinner_idx,
+                    name_max_len,
+                )
+            })
+            .collect();
+
+        TabLayout {
+            truncated_start,
+            truncated_end,
+            tabs,
+            names,
+        }
+    }
+
+    fn render_tabs_from_layout(&self, state: &ZellijState, layout: &TabLayout) -> String {
+        let mut output = String::new();
+
+        if layout.truncated_start > 0 {
+            for f in &self.tab_truncate_start_format {
+                let mut content = f.content.clone();
+                if content.contains("{count}") {
+                    content = content.replace(
+                        "{count}",
+                        (layout.truncated_start).to_string().as_str(),
+                    );
+                }
+                output.push_str(&f.format_string(&content));
+            }
+        }
+
+        for (idx, tab) in layout.tabs.iter().enumerate() {
+            let display_name = layout
+                .names
+                .get(idx)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let mut content = self.render_tab(tab, &state.panes, &state.mode, display_name);
+
+            if idx + 1 < layout.tabs.len()
+                && let Some(sep) = &self.separator
+            {
+                content.push_str(&sep.format_string(&sep.content));
+            }
+
+            output.push_str(&content);
+        }
+
+        if layout.truncated_end > 0 {
+            for f in &self.tab_truncate_end_format {
+                let mut content = f.content.clone();
+                if content.contains("{count}") {
+                    content =
+                        content.replace("{count}", (layout.truncated_end).to_string().as_str());
+                }
+                output.push_str(&f.format_string(&content));
+            }
+        }
+
+        output
     }
 
     fn render_tab(
@@ -433,7 +552,7 @@ impl TabsWidget {
         }
 
         // No override: use zellij tab name
-        tab.name.clone()
+        self.truncate_name_dynamic(&tab.name, name_max_len)
     }
 
     fn truncate_name_dynamic(&self, name: &str, max_len: usize) -> String {
@@ -540,7 +659,7 @@ pub fn get_tab_window(
 mod test {
     use zellij_tile::prelude::TabInfo;
 
-    use super::get_tab_window;
+    use super::*;
     use rstest::rstest;
 
     #[rstest]
