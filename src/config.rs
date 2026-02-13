@@ -24,6 +24,9 @@ pub struct ZellijState {
     pub start_time: DateTime<Local>,
     pub incoming_notification: Option<notification::Message>,
     pub cache_mask: u8,
+    pub tab_name_overrides: BTreeMap<usize, BTreeMap<u32, String>>,
+    pub tab_name_fallbacks: BTreeMap<usize, BTreeMap<u32, String>>,
+    pub spinner_idx: usize,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]

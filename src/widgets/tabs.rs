@@ -9,6 +9,8 @@ use crate::{config::ZellijState, render::FormattedPart};
 
 use super::widget::Widget;
 
+const SPINNER_FRAMES: &[&str] = &["✦", "✶", "✽", "✶"];
+
 pub struct TabsWidget {
     active_tab_format: Vec<FormattedPart>,
     active_tab_fullscreen_format: Vec<FormattedPart>,
@@ -122,7 +124,8 @@ impl Widget for TabsWidget {
         }
 
         for tab in &tabs {
-            let content = self.render_tab(tab, &state.panes, &state.mode);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx);
+            let content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
             counter += 1;
 
             output = format!("{}{}", output, content);
@@ -183,7 +186,8 @@ impl Widget for TabsWidget {
         for tab in &tabs {
             counter += 1;
 
-            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode);
+            let display_name = self.resolve_tab_name(tab, &state.panes, &state.tab_name_overrides, &state.tab_name_fallbacks, state.spinner_idx);
+            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode, &display_name);
 
             if counter < tabs.len()
                 && let Some(sep) = &self.separator
@@ -250,7 +254,7 @@ impl TabsWidget {
         &self.normal_tab_format
     }
 
-    fn render_tab(&self, tab: &TabInfo, panes: &PaneManifest, mode: &ModeInfo) -> String {
+    fn render_tab(&self, tab: &TabInfo, panes: &PaneManifest, mode: &ModeInfo, display_name: &str) -> String {
         let formatters = self.select_format(tab, mode);
         let mut output = "".to_owned();
 
@@ -262,7 +266,7 @@ impl TabsWidget {
                     true => "Enter name...",
                     false => tab.name.as_str(),
                 },
-                _name => tab.name.as_str(),
+                _name => display_name,
             };
 
             if content.contains("{name}") {
@@ -332,6 +336,66 @@ impl TabsWidget {
         }
 
         content
+    }
+
+    fn resolve_tab_name(
+        &self,
+        tab: &TabInfo,
+        panes: &PaneManifest,
+        overrides: &BTreeMap<usize, BTreeMap<u32, String>>,
+        fallbacks: &BTreeMap<usize, BTreeMap<u32, String>>,
+        spinner_idx: usize,
+    ) -> String {
+        if let Some(tab_ovr) = overrides.get(&tab.position) {
+            if !tab_ovr.is_empty() {
+                let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
+                let tab_fb = fallbacks.get(&tab.position);
+
+                let symbols: Vec<String> = tab_ovr
+                    .values()
+                    .map(|raw| {
+                        let sym = raw.strip_prefix("🤖 ").unwrap_or(raw).to_string();
+                        if sym.contains("{spin}") { sym.replace("{spin}", frame) } else { sym }
+                    })
+                    .collect();
+                let chained = format!("🤖 {}", symbols.join(" "));
+
+                let best_id = tab_ovr
+                    .iter()
+                    .find(|(_, s)| s.contains("{spin}"))
+                    .or_else(|| tab_ovr.iter().next())
+                    .map(|(id, _)| id)
+                    .unwrap();
+                let project = tab_fb
+                    .and_then(|m| m.get(best_id))
+                    .map(|s| s.as_str());
+                let pane_title = panes.panes.get(&tab.position)
+                    .and_then(|ps| ps.iter().find(|p| p.id == *best_id && !p.is_plugin))
+                    .and_then(|p| {
+                        let title = p.title.trim();
+                        if title.is_empty() { None } else { Some(title.to_string()) }
+                    });
+
+                let text = match (project, pane_title.as_deref()) {
+                    (Some(p), Some(t)) => Some(format!("{} {}", p, t)),
+                    (Some(p), None) => Some(p.to_string()),
+                    (None, Some(t)) => Some(t.to_string()),
+                    (None, None) => None,
+                };
+
+                let extra = tab_ovr.len() - 1;
+                let suffix = if extra > 0 { format!(" (+{})", extra) } else { String::new() };
+                let sep = if extra > 0 { " | " } else { " " };
+
+                return if let Some(t) = text {
+                    format!("{}{}{}{}", chained, sep, t, suffix)
+                } else {
+                    format!("{}{}", chained, suffix)
+                };
+            }
+        }
+
+        tab.name.clone()
     }
 }
 

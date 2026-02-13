@@ -100,6 +100,9 @@ impl ZellijPlugin for State {
             start_time: Local::now(),
             cache_mask: 0,
             incoming_notification: None,
+            tab_name_overrides: BTreeMap::new(),
+            tab_name_fallbacks: BTreeMap::new(),
+            spinner_idx: 0,
         };
     }
 
