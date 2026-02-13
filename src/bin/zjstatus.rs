@@ -29,6 +29,8 @@ struct State {
     module_config: config::ModuleConfig,
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     err: Option<anyhow::Error>,
+    timer_active: bool,
+    pending_pipe_overrides: Vec<(u32, String, Option<String>)>,
 }
 
 #[cfg(not(test))]
@@ -63,6 +65,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         subscribe(&[
@@ -73,6 +76,7 @@ impl ZellijPlugin for State {
             EventType::TabUpdate,
             EventType::SessionUpdate,
             EventType::RunCommandResult,
+            EventType::Timer,
         ]);
 
         self.module_config = match ModuleConfig::new(&configuration) {
@@ -107,20 +111,86 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        // Handle "title" pipe for tab naming
+        if pipe_message.name == "title" {
+            if let Some(target_session) = pipe_message.args.get("session") {
+                if let Some(ref current_session) = self.state.mode.session_name {
+                    if target_session != current_session {
+                        return false;
+                    }
+                }
+            }
+
+            if let Some(payload) = pipe_message.payload {
+                let pane_id = pipe_message
+                    .args
+                    .get("pane_id")
+                    .and_then(|s| s.parse::<u32>().ok());
+
+                let tab_pos = pane_id.and_then(|id| self.find_tab_for_pane(id));
+
+                if tab_pos.is_none() {
+                    if let Some(id) = pane_id {
+                        let fb = pipe_message.args.get("fallback").cloned();
+                        self.pending_pipe_overrides.push((id, payload, fb));
+                        return false;
+                    }
+                }
+
+                // Empty payload = clear override
+                if payload.is_empty() {
+                    if let Some(id) = pane_id {
+                        for inner in self.state.tab_name_overrides.values_mut() {
+                            inner.remove(&id);
+                        }
+                        self.state.tab_name_overrides.retain(|_, m| !m.is_empty());
+                        for inner in self.state.tab_name_fallbacks.values_mut() {
+                            inner.remove(&id);
+                        }
+                        self.state.tab_name_fallbacks.retain(|_, m| !m.is_empty());
+                        self.state.cache_mask = UpdateEventMask::Tab as u8;
+                        return true;
+                    }
+                    return false;
+                }
+
+                if let Some(pos) = tab_pos {
+                    let id = pane_id.unwrap();
+                    self.state.tab_name_overrides.entry(pos).or_default().insert(id, payload);
+                    if let Some(fb) = pipe_message.args.get("fallback") {
+                        self.state.tab_name_fallbacks.entry(pos).or_default().insert(id, fb.clone());
+                    }
+                    self.ensure_timer();
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Handle "focus" pipe to switch to tab containing a pane
+        if pipe_message.name == "focus" {
+            if let Some(target_session) = pipe_message.args.get("session") {
+                if let Some(ref current_session) = self.state.mode.session_name {
+                    if target_session != current_session {
+                        return false;
+                    }
+                }
+            }
+            if let Some(pane_id) = pipe_message
+                .args
+                .get("pane_id")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                focus_terminal_pane(pane_id, false);
+            }
+            return false;
+        }
+
         let mut should_render = false;
 
         match pipe_message.source {
-            PipeSource::Cli(_) => {
-                if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
-                }
-            }
-            PipeSource::Plugin(_) => {
-                if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
-                }
-            }
-            PipeSource::Keybind => {
+            PipeSource::Cli(_) | PipeSource::Plugin(_) | PipeSource::Keybind => {
                 if let Some(input) = pipe_message.payload {
                     should_render = pipe::parse_protocol(&mut self.state, &input);
                 }
@@ -220,9 +290,15 @@ impl State {
                 );
 
                 self.state.panes = pane_info;
-                self.state.cache_mask = UpdateEventMask::Tab as u8;
 
-                should_render = true;
+                let had_pending = !self.pending_pipe_overrides.is_empty();
+                self.resolve_pending_overrides();
+                self.ensure_timer();
+
+                if had_pending {
+                    self.state.cache_mask = UpdateEventMask::Tab as u8;
+                    should_render = true;
+                }
             }
             Event::PermissionRequestResult(result) => {
                 tracing::Span::current().record("event_type", "Event::PermissionRequestResult");
@@ -295,11 +371,102 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
+                // Rebuild overrides with correct tab positions
+                let mut new_overrides: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                for (_, inner) in std::mem::take(&mut self.state.tab_name_overrides) {
+                    for (pane_id, value) in inner {
+                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                            new_overrides.entry(new_pos).or_default().insert(pane_id, value);
+                        }
+                    }
+                }
+                self.state.tab_name_overrides = new_overrides;
+
+                let mut new_fallbacks: BTreeMap<usize, BTreeMap<u32, String>> = BTreeMap::new();
+                for (_, inner) in std::mem::take(&mut self.state.tab_name_fallbacks) {
+                    for (pane_id, value) in inner {
+                        if let Some(new_pos) = self.find_tab_for_pane(pane_id) {
+                            new_fallbacks.entry(new_pos).or_default().insert(pane_id, value);
+                        }
+                    }
+                }
+                self.state.tab_name_fallbacks = new_fallbacks;
+
+                self.resolve_pending_overrides();
+                self.ensure_timer();
+
                 should_render = true;
+            }
+            Event::Timer(_) => {
+                self.state.spinner_idx = self.state.spinner_idx.wrapping_add(1);
+                self.state.cache_mask = UpdateEventMask::Tab as u8;
+
+                let has_spin = self
+                    .state
+                    .tab_name_overrides
+                    .values()
+                    .flat_map(|m| m.values())
+                    .any(|v| v.contains("{spin}"));
+                if has_spin {
+                    set_timeout(0.3);
+                    should_render = true;
+                } else {
+                    self.timer_active = false;
+                }
             }
             _ => (),
         };
         should_render
+    }
+
+    fn ensure_timer(&mut self) {
+        if self.timer_active {
+            return;
+        }
+        let has_spin = self
+            .state
+            .tab_name_overrides
+            .values()
+            .flat_map(|m| m.values())
+            .any(|v| v.contains("{spin}"));
+        if has_spin {
+            self.timer_active = true;
+            set_timeout(0.3);
+        }
+    }
+
+    fn resolve_pending_overrides(&mut self) {
+        let pending = std::mem::take(&mut self.pending_pipe_overrides);
+        for (pane_id, payload, fallback) in pending {
+            if let Some(pos) = self.find_tab_for_pane(pane_id) {
+                if payload.is_empty() {
+                    if let Some(inner) = self.state.tab_name_overrides.get_mut(&pos) {
+                        inner.remove(&pane_id);
+                        if inner.is_empty() {
+                            self.state.tab_name_overrides.remove(&pos);
+                        }
+                    }
+                } else {
+                    self.state.tab_name_overrides.entry(pos).or_default().insert(pane_id, payload);
+                    if let Some(fb) = fallback {
+                        self.state.tab_name_fallbacks.entry(pos).or_default().insert(pane_id, fb);
+                    }
+                }
+            } else {
+                self.pending_pipe_overrides.push((pane_id, payload, fallback));
+            }
+        }
+    }
+
+    fn find_tab_for_pane(&self, pane_id: u32) -> Option<usize> {
+        for tab in &self.state.tabs {
+            if let Some(panes) = self.state.panes.panes.get(&tab.position) {
+                if panes.iter().any(|p| p.id == pane_id && !p.is_plugin) {
+                    return Some(tab.position);
+                }
+            }
+        }
+        None
     }
 }
 
