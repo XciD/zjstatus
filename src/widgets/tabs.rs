@@ -270,7 +270,8 @@ impl TabsWidget {
             };
 
             if content.contains("{name}") {
-                content = content.replace("{name}", tab_name);
+                let rendered_name = render_inline_format(tab_name, f.fg);
+                content = content.replace("{name}", &rendered_name);
             }
 
             if content.contains("{index}") {
@@ -372,8 +373,8 @@ impl TabsWidget {
                 let pane_title = panes.panes.get(&tab.position)
                     .and_then(|ps| ps.iter().find(|p| p.id == *best_id && !p.is_plugin))
                     .and_then(|p| {
-                        let title = p.title.trim();
-                        if title.is_empty() { None } else { Some(title.to_string()) }
+                        let (title, _had_prefix) = strip_spinner_prefix(p.title.trim());
+                        if title.is_empty() { None } else { Some(title) }
                     });
 
                 let text = match (project, pane_title.as_deref()) {
@@ -397,6 +398,93 @@ impl TabsWidget {
 
         tab.name.clone()
     }
+}
+
+/// Strip leading spinner prefix (e.g. "⠋ " or "● ") from pane titles.
+/// Returns (stripped_text, had_prefix).
+fn strip_spinner_prefix(s: &str) -> (String, bool) {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if !c.is_alphanumeric() => (chars.as_str().trim_start().to_string(), true),
+        _ => (s.to_string(), false),
+    }
+}
+
+fn render_inline_format(s: &str, parent_fg: Option<anstyle::Color>) -> String {
+    if !s.contains("#[") {
+        return s.to_string();
+    }
+    let restore_fg = color_to_ansi_fg(parent_fg);
+    let mut result = String::new();
+    let mut first = true;
+    for segment in s.split("#[") {
+        if first {
+            result.push_str(segment);
+            first = false;
+            continue;
+        }
+        if let Some(bracket_end) = segment.find(']') {
+            let attrs = &segment[..bracket_end];
+            let text = &segment[bracket_end + 1..];
+            if let Some(color_str) = attrs.strip_prefix("fg=") {
+                if color_str.is_empty() {
+                    result.push_str(&restore_fg);
+                } else if let Some(hex) = color_str.strip_prefix('#') {
+                    if let Ok(rgb) = hex_to_rgb(hex) {
+                        result.push_str(&format!("\x1b[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2));
+                    }
+                }
+            }
+            result.push_str(text);
+        } else {
+            result.push_str("#[");
+            result.push_str(segment);
+        }
+    }
+    result
+}
+
+fn color_to_ansi_fg(color: Option<anstyle::Color>) -> String {
+    match color {
+        Some(anstyle::Color::Rgb(anstyle::RgbColor(r, g, b))) => {
+            format!("\x1b[38;2;{};{};{}m", r, g, b)
+        }
+        Some(anstyle::Color::Ansi(c)) => {
+            let code = match c {
+                anstyle::AnsiColor::Black => 30,
+                anstyle::AnsiColor::Red => 31,
+                anstyle::AnsiColor::Green => 32,
+                anstyle::AnsiColor::Yellow => 33,
+                anstyle::AnsiColor::Blue => 34,
+                anstyle::AnsiColor::Magenta => 35,
+                anstyle::AnsiColor::Cyan => 36,
+                anstyle::AnsiColor::White => 37,
+                anstyle::AnsiColor::BrightBlack => 90,
+                anstyle::AnsiColor::BrightRed => 91,
+                anstyle::AnsiColor::BrightGreen => 92,
+                anstyle::AnsiColor::BrightYellow => 93,
+                anstyle::AnsiColor::BrightBlue => 94,
+                anstyle::AnsiColor::BrightMagenta => 95,
+                anstyle::AnsiColor::BrightCyan => 96,
+                anstyle::AnsiColor::BrightWhite => 97,
+            };
+            format!("\x1b[{}m", code)
+        }
+        Some(anstyle::Color::Ansi256(anstyle::Ansi256Color(n))) => {
+            format!("\x1b[38;5;{}m", n)
+        }
+        None => "\x1b[39m".to_string(),
+    }
+}
+
+fn hex_to_rgb(hex: &str) -> Result<(u8, u8, u8), ()> {
+    if hex.len() != 6 {
+        return Err(());
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
+    let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| ())?;
+    let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| ())?;
+    Ok((r, g, b))
 }
 
 pub fn get_tab_window(

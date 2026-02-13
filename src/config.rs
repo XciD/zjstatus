@@ -16,6 +16,7 @@ pub struct ZellijState {
     pub cols: usize,
     pub command_results: BTreeMap<String, CommandResult>,
     pub pipe_results: BTreeMap<String, String>,
+    pub is_current_tab_plugin: bool,
     pub mode: ModeInfo,
     pub panes: PaneManifest,
     pub plugin_uuid: String,
@@ -178,15 +179,27 @@ impl ModuleConfig {
         mouse: Mouse,
         widget_map: BTreeMap<String, Arc<dyn Widget>>,
     ) {
-        let click_pos = match mouse {
+        let (click_line, click_pos) = match mouse {
             Mouse::ScrollUp(_) => return,
             Mouse::ScrollDown(_) => return,
-            Mouse::LeftClick(_, y) => y,
-            Mouse::RightClick(_, y) => y,
-            Mouse::Hold(_, y) => y,
-            Mouse::Release(_, y) => y,
+            Mouse::LeftClick(line, column) => (line, column),
+            Mouse::RightClick(line, column) => (line, column),
+            Mouse::Hold(line, column) => (line, column),
+            Mouse::Release(line, column) => (line, column),
             Mouse::Hover(_, _) => return,
         };
+        let click_line = match usize::try_from(click_line) {
+            Ok(line) => line,
+            Err(_) => return,
+        };
+        let status_line = if self.border.enabled && self.border.position == BorderPosition::Top {
+            1
+        } else {
+            0
+        };
+        if click_line != status_line {
+            return;
+        }
 
         let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
             format!(
@@ -195,6 +208,7 @@ impl ModuleConfig {
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
+        let output_left = self.inject_session_left(output_left, &state);
 
         let output_center = self
             .center_parts
@@ -343,6 +357,7 @@ impl ModuleConfig {
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
+        let output_left = self.inject_session_left(output_left, &state);
 
         let output_center = self
             .center_parts
@@ -509,6 +524,23 @@ impl ModuleConfig {
         let space_count = cols.saturating_sub(text_count);
 
         self.format_space.format_string(&" ".repeat(space_count))
+    }
+
+    fn inject_session_left(&self, output_left: String, state: &ZellijState) -> String {
+        if self.left_parts_config.contains("{session}") {
+            return output_left;
+        }
+
+        let session_name = match &state.mode.session_name {
+            Some(name) if !name.is_empty() => name,
+            _ => return output_left,
+        };
+
+        if output_left.is_empty() {
+            session_name.to_owned()
+        } else {
+            format!("{session_name} {output_left}")
+        }
     }
 }
 
