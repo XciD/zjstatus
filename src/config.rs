@@ -189,8 +189,8 @@ impl ModuleConfig {
             Mouse::ScrollDown(_) => return,
             Mouse::LeftClick(_, y) => y,
             Mouse::RightClick(_, y) => y,
-            Mouse::Hold(_, y) => y,
-            Mouse::Release(_, y) => y,
+            Mouse::Hold(_, _) => return,
+            Mouse::Release(_, _) => return,
             Mouse::Hover(_, _) => return,
         };
 

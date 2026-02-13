@@ -1,4 +1,4 @@
-use std::{cmp, collections::BTreeMap};
+use std::{cell::RefCell, cmp, collections::BTreeMap};
 
 use zellij_tile::{
     prelude::{InputMode, ModeInfo, PaneInfo, PaneManifest, TabInfo},
@@ -14,6 +14,7 @@ use super::widget::Widget;
 const SPINNER_FRAMES: &[&str] = &["✦", "✶", "✽", "✶"];
 const MIN_TAB_NAME_LEN: usize = 5;
 
+#[derive(Clone)]
 struct TabLayout {
     truncated_start: usize,
     truncated_end: usize,
@@ -49,6 +50,7 @@ pub struct TabsWidget {
     tab_truncate_start_format: Vec<FormattedPart>,
     tab_truncate_end_format: Vec<FormattedPart>,
     tab_name_max_len: usize,
+    rendered_layout: RefCell<Option<TabLayout>>,
 }
 
 impl TabsWidget {
@@ -128,6 +130,7 @@ impl TabsWidget {
             tab_truncate_start_format,
             tab_truncate_end_format,
             tab_name_max_len,
+            rendered_layout: RefCell::new(None),
         }
     }
 }
@@ -138,14 +141,22 @@ impl Widget for TabsWidget {
             return "".to_owned();
         }
         let layout = self.compute_layout(state);
-        self.render_tabs_from_layout(state, &layout)
+        let output = self.render_tabs_from_layout(state, &layout);
+        *self.rendered_layout.borrow_mut() = Some(layout);
+        output
     }
 
     fn process_click(&self, _name: &str, state: &ZellijState, pos: usize) {
         let mut offset = 0;
         let mut counter = 0;
 
-        let layout = self.compute_layout(state);
+        // Use the layout from the last render (matches what's on screen)
+        // instead of recomputing (which could differ if state changed).
+        let layout = self
+            .rendered_layout
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.compute_layout(state));
         let tabs = &layout.tabs;
         let names = &layout.names;
         if tabs.is_empty() {
