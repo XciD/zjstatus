@@ -290,15 +290,12 @@ impl State {
                 );
 
                 self.state.panes = pane_info;
+                self.state.cache_mask = UpdateEventMask::Tab as u8;
 
-                let had_pending = !self.pending_pipe_overrides.is_empty();
                 self.resolve_pending_overrides();
                 self.ensure_timer();
 
-                if had_pending {
-                    self.state.cache_mask = UpdateEventMask::Tab as u8;
-                    should_render = true;
-                }
+                should_render = true;
             }
             Event::PermissionRequestResult(result) => {
                 tracing::Span::current().record("event_type", "Event::PermissionRequestResult");
