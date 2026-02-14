@@ -179,36 +179,25 @@ impl ModuleConfig {
         mouse: Mouse,
         widget_map: BTreeMap<String, Arc<dyn Widget>>,
     ) {
-        let (click_line, click_pos) = match mouse {
+        let click_pos = match mouse {
             Mouse::ScrollUp(_) => return,
             Mouse::ScrollDown(_) => return,
-            Mouse::LeftClick(line, column) => (line, column),
-            Mouse::RightClick(line, column) => (line, column),
-            Mouse::Hold(line, column) => (line, column),
-            Mouse::Release(line, column) => (line, column),
+            Mouse::LeftClick(_, y) => y,
+            Mouse::RightClick(_, y) => y,
+            Mouse::Hold(_, y) => y,
+            Mouse::Release(_, y) => y,
             Mouse::Hover(_, _) => return,
         };
-        let click_line = match usize::try_from(click_line) {
-            Ok(line) => line,
-            Err(_) => return,
-        };
-        let status_line = if self.border.enabled && self.border.position == BorderPosition::Top {
-            1
-        } else {
-            0
-        };
-        if click_line != status_line {
-            return;
-        }
 
-        let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
+        let output_left_raw = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
             format!(
                 "{}{}",
                 acc,
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
-        let output_left = self.inject_session_left(output_left, &state);
+        let left_widget_offset = self.inject_session_left_prefix_width(&output_left_raw, &state);
+        let output_left = self.inject_session_left(output_left_raw, &state);
 
         let output_center = self
             .center_parts
@@ -238,8 +227,15 @@ impl ModuleConfig {
         };
 
         let mut offset = console::measure_text_width(&output_left);
-
-        self.process_widget_click(click_pos, &self.left_parts, &widget_map, &state, 0);
+        if !output_left.is_empty() {
+            self.process_widget_click(
+                click_pos,
+                &self.left_parts,
+                &widget_map,
+                &state,
+                left_widget_offset,
+            );
+        }
 
         if click_pos <= offset {
             return;
@@ -539,8 +535,21 @@ impl ModuleConfig {
         if output_left.is_empty() {
             session_name.to_owned()
         } else {
-            format!("{session_name} {output_left}")
+            format!("{session_name} | {output_left}")
         }
+    }
+
+    fn inject_session_left_prefix_width(&self, output_left: &str, state: &ZellijState) -> usize {
+        if self.left_parts_config.contains("{session}") || output_left.is_empty() {
+            return 0;
+        }
+
+        let session_name = match &state.mode.session_name {
+            Some(name) if !name.is_empty() => name,
+            _ => return 0,
+        };
+
+        console::measure_text_width(&format!("{session_name} | "))
     }
 }
 

@@ -82,7 +82,8 @@ impl TabsWidget {
 
         let separator = config
             .get("tab_separator")
-            .map(|s| FormattedPart::from_format_string(s, config));
+            .map(|s| FormattedPart::from_format_string(s, config))
+            .or_else(|| Some(FormattedPart::from_format_string(" | ", config)));
 
         Self {
             normal_tab_format,
