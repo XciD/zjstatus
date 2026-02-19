@@ -200,6 +200,29 @@ in this repo for obtaining `cargo` and `rustup`. Then you'll only need to add th
 With the toolchain, simply build `zjstatus` with `cargo build`. Then you are able to run the example configuration
 with `zellij -l plugin-dev-workspace.kdl` from the root of the repository.
 
+## 🤖 Claude hook (zjstatus)
+
+This repository ships a Claude Code hook at `claude-hooks/claude-tab-status.sh`.
+It publishes Claude activity to zellij via `zellij pipe`, so you can wire Claude
+state into tab title workflows and `zjstatus` notifications.
+
+Install it with:
+
+```bash
+./install-claude-hook.sh
+```
+
+The installer will:
+
+- copy the hook to `~/.claude/hooks/claude-tab-status.sh`
+- register it in `~/.claude/settings.json` for Claude events
+
+If you use a different Claude settings file, override it when installing:
+
+```bash
+CLAUDE_SETTINGS=~/.claude/settings.local.json ./install-claude-hook.sh
+```
+
 ## 🤝 Contributing
 
 If you are missing features or find some annoying bugs please feel free to submit an issue or a bugfix within a pull request :)
