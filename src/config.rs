@@ -5,7 +5,7 @@ use regex::Regex;
 use zellij_tile::prelude::*;
 
 use crate::{
-    border::{parse_border_config, BorderConfig, BorderPosition},
+    border::{BorderConfig, BorderPosition, parse_border_config},
     render::FormattedPart,
     widgets::{command::CommandResult, notification, widget::Widget},
 };
@@ -16,6 +16,7 @@ pub struct ZellijState {
     pub cols: usize,
     pub command_results: BTreeMap<String, CommandResult>,
     pub pipe_results: BTreeMap<String, String>,
+    pub is_current_tab_plugin: bool,
     pub mode: ModeInfo,
     pub panes: PaneManifest,
     pub plugin_uuid: String,
@@ -24,6 +25,9 @@ pub struct ZellijState {
     pub start_time: DateTime<Local>,
     pub incoming_notification: Option<notification::Message>,
     pub cache_mask: u8,
+    pub tab_name_overrides: BTreeMap<usize, BTreeMap<u32, String>>,
+    pub tab_name_fallbacks: BTreeMap<usize, BTreeMap<u32, String>>,
+    pub spinner_idx: usize,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]
@@ -185,13 +189,15 @@ impl ModuleConfig {
             Mouse::Hover(_, _) => return,
         };
 
-        let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
+        let output_left_raw = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
             format!(
                 "{}{}",
                 acc,
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
+        let left_widget_offset = self.inject_session_left_prefix_width(&output_left_raw, &state);
+        let output_left = self.inject_session_left(output_left_raw, &state);
 
         let output_center = self
             .center_parts
@@ -221,8 +227,15 @@ impl ModuleConfig {
         };
 
         let mut offset = console::measure_text_width(&output_left);
-
-        self.process_widget_click(click_pos, &self.left_parts, &widget_map, &state, 0);
+        if !output_left.is_empty() {
+            self.process_widget_click(
+                click_pos,
+                &self.left_parts,
+                &widget_map,
+                &state,
+                left_widget_offset,
+            );
+        }
 
         if click_pos <= offset {
             return;
@@ -340,6 +353,7 @@ impl ModuleConfig {
                 part.format_string_with_widgets(&widget_map, &state)
             )
         });
+        let output_left = self.inject_session_left(output_left, &state);
 
         let output_center = self
             .center_parts
@@ -366,6 +380,25 @@ impl ModuleConfig {
             false => (output_left, output_center, output_right),
         };
 
+        let bar_content = if !output_center.is_empty() {
+            format!(
+                "{}{}{}{}{}",
+                output_left,
+                self.get_spacer_left(&output_left, &output_center, state.cols),
+                output_center,
+                self.get_spacer_right(&output_right, &output_center, state.cols),
+                output_right,
+            )
+        } else {
+            format!(
+                "{}{}{}",
+                output_left,
+                self.get_spacer(&output_left, &output_right, state.cols),
+                output_right,
+            )
+        };
+        let bar_content = self.truncate_output_to_cols(bar_content, state.cols);
+
         if self.border.enabled {
             let mut border_top = "".to_owned();
             if self.border.enabled && self.border.position == BorderPosition::Top {
@@ -377,46 +410,10 @@ impl ModuleConfig {
                 border_bottom = format!("\n{}", self.border.draw(state.cols));
             }
 
-            if !output_center.is_empty() {
-                return format!(
-                    "{}{}{}{}{}{}{}",
-                    border_top,
-                    output_left,
-                    self.get_spacer_left(&output_left, &output_center, state.cols),
-                    output_center,
-                    self.get_spacer_right(&output_right, &output_center, state.cols),
-                    output_right,
-                    border_bottom,
-                );
-            }
-
-            return format!(
-                "{}{}{}{}{}",
-                border_top,
-                output_left,
-                self.get_spacer(&output_left, &output_right, state.cols),
-                output_right,
-                border_bottom,
-            );
+            return format!("{}{}{}", border_top, bar_content, border_bottom);
         }
 
-        if !output_center.is_empty() {
-            return format!(
-                "{}{}{}{}{}",
-                output_left,
-                self.get_spacer_left(&output_left, &output_center, state.cols),
-                output_center,
-                self.get_spacer_right(&output_right, &output_center, state.cols),
-                output_right,
-            );
-        }
-
-        format!(
-            "{}{}{}",
-            output_left,
-            self.get_spacer(&output_left, &output_right, state.cols),
-            output_right,
-        )
+        bar_content
     }
 
     fn trim_output(
@@ -506,6 +503,44 @@ impl ModuleConfig {
         let space_count = cols.saturating_sub(text_count);
 
         self.format_space.format_string(&" ".repeat(space_count))
+    }
+
+    fn inject_session_left(&self, output_left: String, state: &ZellijState) -> String {
+        if self.left_parts_config.contains("{session}") {
+            return output_left;
+        }
+
+        let session_name = match &state.mode.session_name {
+            Some(name) if !name.is_empty() => name,
+            _ => return output_left,
+        };
+
+        if output_left.is_empty() {
+            session_name.to_owned()
+        } else {
+            format!("{session_name} | {output_left}")
+        }
+    }
+
+    fn inject_session_left_prefix_width(&self, output_left: &str, state: &ZellijState) -> usize {
+        if self.left_parts_config.contains("{session}") || output_left.is_empty() {
+            return 0;
+        }
+
+        let session_name = match &state.mode.session_name {
+            Some(name) if !name.is_empty() => name,
+            _ => return 0,
+        };
+
+        console::measure_text_width(&format!("{session_name} | "))
+    }
+
+    fn truncate_output_to_cols(&self, output: String, cols: usize) -> String {
+        if cols == 0 || console::measure_text_width(&output) <= cols {
+            return output;
+        }
+
+        console::truncate_str(&output, cols, "").into_owned()
     }
 }
 

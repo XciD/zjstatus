@@ -31,6 +31,8 @@ register_plugin!(State);
 #[cfg(feature = "tracing")]
 fn init_tracing() {
     use std::fs::File;
+    use tracing_subscriber::layer::Layer;
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     let file = File::create("/host/.zjframes.log");
@@ -38,11 +40,11 @@ fn init_tracing() {
         Ok(file) => file,
         Err(error) => panic!("Error: {:?}", error),
     };
-    let debug_log = tracing_subscriber::fmt::layer().with_writer(Arc::new(file));
+    let debug_log = tracing_subscriber::fmt::layer()
+        .with_writer(Arc::new(file))
+        .with_filter(LevelFilter::INFO);
 
     tracing_subscriber::registry().with(debug_log).init();
-
-    tracing::info!("tracing initialized");
 }
 
 impl ZellijPlugin for State {

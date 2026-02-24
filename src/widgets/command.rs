@@ -72,7 +72,9 @@ impl Widget for CommandWidget {
             }
         };
 
-        run_command_if_needed(command_config.clone(), name, state);
+        if state.is_current_tab_plugin {
+            run_command_if_needed(command_config.clone(), name, state);
+        }
 
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
